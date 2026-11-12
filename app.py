@@ -1,21 +1,14 @@
 # ============================================================================
 # TerraTrace — Product Lifecycle Environmental Impact Calculator
-# Theme: Field Ledger · Daylight (warm paper + evergreen instrument panels)
+# Theme: Field Ledger · Daylight + built-in LinkedIn sharing
 # ----------------------------------------------------------------------------
-# Single-file Streamlit MVP. Cradle-to-grave GWP accounting from BOM, energy,
-# transport and end-of-life assumptions, with import validation, scenario lab,
-# Monte Carlo uncertainty, sensitivity analysis, role-based review/approval,
-# audit trail, lineage and report exports. Local SQLite persistence.
-#
 # Run (Windows PowerShell):
 #   python -m venv .venv
 #   .\.venv\Scripts\Activate.ps1
 #   pip install -r requirements.txt
 #   streamlit run app.py
 #
-# IMPORTANT: ships with SYNTHETIC demo data and ILLUSTRATIVE emission factors.
-# Decision support only — not a certified LCA / EPD. Replace factors with a
-# licensed database (e.g. ecoinvent, GREET, DEFRA) before real reporting.
+# SYNTHETIC demo data + ILLUSTRATIVE factors. Decision support only.
 # ============================================================================
 
 import copy
@@ -30,6 +23,7 @@ import random
 import re
 import sqlite3
 import uuid
+import urllib.parse
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -38,10 +32,11 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+import streamlit.components.v1 as components
 
 APP_NAME = "TerraTrace"
 THEME_NAME = "Field Ledger · Daylight"
-ENGINE_VERSION = "1.3.0"
+ENGINE_VERSION = "1.3.1"
 SCHEMA_VERSION = 1
 DB_PATH = Path("data") / "terratrace.db"
 UPLOAD_DIR = Path("data") / "uploads"
@@ -49,6 +44,24 @@ CREDIT_QUALITY = 0.9
 AIR_KM = 2200
 QUALITY_GATE = 0.60
 MAX_UPLOAD_BYTES = 5_000_000
+
+LINKEDIN_POST = (
+    "🌿 TerraTrace — an open-source Product Lifecycle Environmental Impact Calculator "
+    "built with Python + Streamlit. No API keys, no cloud, runs locally.\n\n"
+    "What it does end to end:\n"
+    "🔩 BOM → manufacturing → transport → use phase → end-of-life, with recycling credits "
+    "and a traceable formula for every contribution\n"
+    "🎛️ Live scenario lab: grid intensity, recycled content, air-freight share, lifetime, EoL rates\n"
+    "🎲 Seeded Monte Carlo uncertainty (P5–P95) + tornado sensitivity\n"
+    "📥 CSV/Excel import with row-level validation and error reports\n"
+    "✅ Role-based draft → review → approval workflow with audit trail\n"
+    "📄 One-click HTML/CSV/JSON reports with lineage and factor versions\n\n"
+    "Honest by design: synthetic demo data + illustrative factors, clearly labeled. "
+    "Decision support, not a certified LCA.\n\n"
+    "Run: pip install -r requirements.txt && streamlit run app.py\n\n"
+    "#LCA #CarbonAccounting #Sustainability #Python #Streamlit #OpenSource #ClimateTech"
+)
+LINKEDIN_SHARE_URL = "https://www.linkedin.com/feed/?shareActive=true&text=" + urllib.parse.quote(LINKEDIN_POST, safe="")
 
 STAGES = ["Materials", "Manufacturing", "Distribution", "Use phase", "End-of-life", "Credits"]
 STAGE_COLORS = {
@@ -625,6 +638,7 @@ CSS = """
 --ink:#16281F;--ink2:#31473B;--muted:#68796E;--line:#D9CFBA;--line2:#C7BBA0;
 --evergreen:#123B2E;--evergreen2:#0C2A20;--leaf:#65A30D;--leafbright:#A8E63C;
 --teal:#0D9488;--sky:#2563EB;--amber:#D97706;--red:#DC2626;--violet:#7C3AED;--pink:#DB2777;
+--linkedin:#0A66C2;--linkedin2:#084D92;
 }
 *{scrollbar-width:thin;scrollbar-color:#2E5C49 #E8DFC9;}
 *::-webkit-scrollbar{width:11px;height:11px;}
@@ -660,6 +674,11 @@ background:var(--evergreen)!important;color:#F7F2E7!important;border-color:var(-
 .stButton>button[kind="primary"]:hover,[data-testid="stBaseButton-primary"]:hover,
 button[kind="primaryFormSubmit"]:hover{background:#1C5240!important;color:#F7F2E7!important;}
 .stButton>button:disabled,.stDownloadButton>button:disabled{opacity:.42;transform:none;box-shadow:2px 2px 0 rgba(22,40,31,.08);}
+.stLinkButton>a,[data-testid="stLinkButton"] a,[data-testid="stLinkButton"] button{
+background:var(--linkedin)!important;color:#FFFFFF!important;border:1.5px solid var(--linkedin)!important;
+border-radius:9px;font-weight:700;box-shadow:2px 2px 0 rgba(10,102,194,.25);text-decoration:none!important;}
+.stLinkButton>a:hover,[data-testid="stLinkButton"] a:hover,[data-testid="stLinkButton"] button:hover{
+background:var(--linkedin2)!important;color:#FFFFFF!important;transform:translate(-1px,-1px);}
 [data-baseweb="select"]>div,[data-baseweb="input"],[data-baseweb="textarea"]{
 background:var(--card)!important;border-color:var(--line2)!important;}
 [data-baseweb="select"] *,[data-baseweb="input"] input,[data-baseweb="textarea"] textarea{color:var(--ink)!important;}
@@ -698,6 +717,14 @@ background:linear-gradient(90deg,var(--evergreen2),var(--evergreen));box-shadow:
 .tt-strip .chip.hot{color:#A8E63C;border-color:rgba(168,230,60,.55);}
 .chip{font-size:.68rem;padding:3px 10px;border-radius:999px;border:1px solid var(--line2);color:var(--muted);background:var(--card);letter-spacing:.04em;}
 .chip.hot{color:var(--leaf);border-color:rgba(101,163,13,.5);}
+.tt-share{display:inline-flex;align-items:center;gap:6px;background:var(--linkedin);color:#FFFFFF!important;
+border:1.5px solid #0A66C2;border-radius:9px;padding:5px 12px;font-size:.72rem;font-weight:700;
+letter-spacing:.03em;text-decoration:none!important;box-shadow:2px 2px 0 rgba(10,102,194,.3);transition:all .15s ease;white-space:nowrap;}
+.tt-share:hover{background:var(--linkedin2);color:#FFFFFF!important;transform:translate(-1px,-1px);box-shadow:3px 3px 0 rgba(10,102,194,.35);}
+.tt-share-side{width:100%;justify-content:center;margin-top:8px;padding:8px 12px;font-size:.78rem;}
+.tt-share-card{border:1.5px solid var(--line2);border-radius:14px;background:var(--card);padding:16px 18px;margin:8px 0 16px;box-shadow:4px 4px 0 rgba(22,40,31,.07);}
+.tt-share-card h4{margin:0 0 4px;font-size:1.05rem;}
+.tt-share-card p{margin:0 0 12px;color:var(--muted);font-size:.84rem;}
 .dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#A8E63C;margin-right:6px;animation:pulse 2s infinite;}
 @keyframes pulse{0%{box-shadow:0 0 0 0 rgba(168,230,60,.55)}70%{box-shadow:0 0 0 9px rgba(168,230,60,0)}100%{box-shadow:0 0 0 0 rgba(168,230,60,0)}}
 .tt-kicker{color:var(--teal);font:600 .7rem 'JetBrains Mono',monospace;letter-spacing:.24em;text-transform:uppercase;}
@@ -813,6 +840,7 @@ def grade(score):
 
 def strip(ctx):
     t = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    share_href = htmlmod.escape(LINKEDIN_SHARE_URL, quote=True)
     st.markdown(
         f'<div class="tt-strip"><div><span class="dot"></span>'
         f'<span class="chip hot">ENGINE v{ENGINE_VERSION}</span> '
@@ -820,7 +848,58 @@ def strip(ctx):
         f'<span class="chip">RUN {ctx["run_id"]}</span> '
         f'<span class="chip">THEME {THEME_NAME}</span></div>'
         f'<div><span class="chip">SYNTHETIC DEMO DATA</span> '
-        f'<span class="chip">{t}</span></div></div>', unsafe_allow_html=True)
+        f'<span class="chip">{t}</span> '
+        f'<a class="tt-share" href="{share_href}" target="_blank" rel="noopener noreferrer">in Share on LinkedIn ↗</a>'
+        f'</div></div>', unsafe_allow_html=True)
+
+
+def linkedin_copy_component():
+    payload = json.dumps(LINKEDIN_POST)
+    html = """
+<div style="font-family:Inter,system-ui,sans-serif;">
+  <button id="tt-copy" style="background:#0A66C2;color:#fff;border:1.5px solid #0A66C2;border-radius:9px;
+  padding:9px 16px;font-weight:700;font-size:14px;cursor:pointer;box-shadow:2px 2px 0 rgba(10,102,194,.25);">
+  📋 Copy LinkedIn post</button>
+  <span id="tt-status" style="margin-left:10px;font-size:13px;color:#31473B;"></span>
+</div>
+<script>
+const ttText = __TT_PAYLOAD__;
+const btn = document.getElementById('tt-copy');
+const status = document.getElementById('tt-status');
+function ok(){ status.textContent = 'Copied ✓'; btn.textContent = '✓ Copied'; setTimeout(()=>{btn.textContent='📋 Copy LinkedIn post';status.textContent='';},2200); }
+function fail(){ status.textContent = 'Copy blocked — use the text box below.'; }
+btn.addEventListener('click', async () => {
+  try { await navigator.clipboard.writeText(ttText); ok(); }
+  catch(e) {
+    try {
+      const ta = document.createElement('textarea'); ta.value = ttText; ta.style.position='fixed'; ta.style.opacity='0';
+      document.body.appendChild(ta); ta.focus(); ta.select();
+      const done = document.execCommand('copy'); document.body.removeChild(ta);
+      done ? ok() : fail();
+    } catch(err) { fail(); }
+  }
+});
+</script>
+"""
+    components.html(html.replace("__TT_PAYLOAD__", payload), height=58)
+
+
+def linkedin_share_panel(ctx=None):
+    share_href = htmlmod.escape(LINKEDIN_SHARE_URL, quote=True)
+    st.markdown(
+        '<div class="tt-share-card"><h4>🔗 Share TerraTrace on LinkedIn</h4>'
+        '<p>Opens LinkedIn with a ready-made post. Copy the text first if you want to edit it before publishing.</p></div>',
+        unsafe_allow_html=True)
+    c1, c2 = st.columns([1, 1])
+    with c1:
+        st.link_button("in Share on LinkedIn ↗", LINKEDIN_SHARE_URL, **width_kwargs(st.link_button))
+    with c2:
+        linkedin_copy_component()
+    with st.expander("📝 Preview / edit the LinkedIn post text"):
+        edited = st.text_area("LinkedIn post", value=LINKEDIN_POST, height=260, key="li_post_text")
+        custom_url = "https://www.linkedin.com/feed/?shareActive=true&text=" + urllib.parse.quote(edited, safe="")
+        st.link_button("in Share this edited version ↗", custom_url, key="li_custom_share", **width_kwargs(st.link_button))
+        st.caption("LinkedIn opens in a new tab. If the composer does not pre-fill, paste the copied text.")
 
 
 # ============================================================================
@@ -913,6 +992,9 @@ def build_sidebar(products, version):
             flash("success", f"Scenario “{name}” saved — compare it on the Analysis page.")
             st.rerun()
     sb.markdown("---")
+    share_href = htmlmod.escape(LINKEDIN_SHARE_URL, quote=True)
+    sb.markdown(f'<a class="tt-share tt-share-side" href="{share_href}" target="_blank" rel="noopener noreferrer">'
+                f'in Share on LinkedIn ↗</a>', unsafe_allow_html=True)
     sb.caption(f"Engine v{ENGINE_VERSION} · Factors {version} · SQLite local\n\n"
                f"Theme: {THEME_NAME}. Demo roles are simulated; all data is synthetic.")
     return ss["selected_product"], ss["role"], ss["actor_name"]
@@ -1021,6 +1103,7 @@ def page_overview(ctx):
         with st.expander("Data quality flags"):
             for lvl, msg in res["flags"]:
                 st.markdown(f'<span class="b b-{lvl}">{lvl}</span> {htmlmod.escape(msg)}', unsafe_allow_html=True)
+    linkedin_share_panel(ctx)
     st.caption(f'Run {ctx["run_id"]} · engine v{ENGINE_VERSION} · factors {ctx["version"]} · '
                "Monte Carlo is seeded and reproducible. Synthetic demo data — decision support only.")
 
@@ -1681,6 +1764,7 @@ def page_reports(ctx):
     strip(ctx)
     sec("Export", "Reports & exports",
         "Every export is logged to the audit trail and carries run ID, factor version, assumptions and limitations.")
+    linkedin_share_panel(ctx)
     inc = {
         "contributions": st.checkbox("Contribution ledger (formulas)", True, key="rp_c"),
         "uncertainty": st.checkbox("Monte Carlo uncertainty", True, key="rp_u"),
