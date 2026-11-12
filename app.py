@@ -1,775 +1,147 @@
-# ============================================================================
-# TerraTrace — Product Lifecycle Environmental Impact Calculator
-# Theme: Field Ledger · Daylight + built-in LinkedIn sharing
-# ----------------------------------------------------------------------------
-# Run (Windows PowerShell):
-#   python -m venv .venv
-#   .\.venv\Scripts\Activate.ps1
-#   pip install -r requirements.txt
-#   streamlit run app.py
-#
-# SYNTHETIC demo data + ILLUSTRATIVE factors. Decision support only.
-# ============================================================================
+"""
+EcoLedger LCA — Product Lifecycle Environmental Impact Calculator (Project 014)
+Single-file Streamlit application. No API keys. All data is SYNTHETIC and clearly labeled.
 
+Run on Windows (PowerShell):
+    python -m venv .venv
+    .\\.venv\\Scripts\\Activate.ps1
+    pip install -r requirements.txt
+    streamlit run app.py
+
+The app auto-loads a synthetic demo portfolio, auto-runs the Monte Carlo simulation,
+and is fully interactive on first paint. Roles: Administrator / Analyst / Reviewer /
+Stakeholder (switch in the sidebar to test server-side-style permission guards).
+"""
+from __future__ import annotations
+
+import base64
 import copy
-import difflib
 import hashlib
-import html as htmlmod
+import html as html_lib
 import inspect
 import io
 import json
 import math
 import random
-import re
-import sqlite3
+import time
 import uuid
-import urllib.parse
-from contextlib import closing
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-import streamlit.components.v1 as components
+from streamlit.components.v1 import html as components_html
 
-APP_NAME = "TerraTrace"
-THEME_NAME = "Field Ledger · Daylight"
-ENGINE_VERSION = "1.3.1"
+# ══════════════════════════════ CONSTANTS & PALETTE ══════════════════════════════
+APP_NAME = "EcoLedger LCA"
+ENGINE_VERSION = "1.0.0"
 SCHEMA_VERSION = 1
-DB_PATH = Path("data") / "terratrace.db"
-UPLOAD_DIR = Path("data") / "uploads"
-CREDIT_QUALITY = 0.9
-AIR_KM = 2200
-QUALITY_GATE = 0.60
-MAX_UPLOAD_BYTES = 5_000_000
+BASE_FACTOR_VERSION = "SYN-2026.1"
 
-LINKEDIN_POST = (
-    "🌿 TerraTrace — an open-source Product Lifecycle Environmental Impact Calculator "
-    "built with Python + Streamlit. No API keys, no cloud, runs locally.\n\n"
-    "What it does end to end:\n"
-    "🔩 BOM → manufacturing → transport → use phase → end-of-life, with recycling credits "
-    "and a traceable formula for every contribution\n"
-    "🎛️ Live scenario lab: grid intensity, recycled content, air-freight share, lifetime, EoL rates\n"
-    "🎲 Seeded Monte Carlo uncertainty (P5–P95) + tornado sensitivity\n"
-    "📥 CSV/Excel import with row-level validation and error reports\n"
-    "✅ Role-based draft → review → approval workflow with audit trail\n"
-    "📄 One-click HTML/CSV/JSON reports with lineage and factor versions\n\n"
-    "Honest by design: synthetic demo data + illustrative factors, clearly labeled. "
-    "Decision support, not a certified LCA.\n\n"
-    "Run: pip install -r requirements.txt && streamlit run app.py\n\n"
-    "#LCA #CarbonAccounting #Sustainability #Python #Streamlit #OpenSource #ClimateTech"
-)
-LINKEDIN_SHARE_URL = "https://www.linkedin.com/feed/?shareActive=true&text=" + urllib.parse.quote(LINKEDIN_POST, safe="")
+FOREST, LEAF, LIME = "#0E3B2E", "#2E7D5B", "#A8E10C"
+AMBER, SKY, TERRA = "#F2A007", "#2D9CDB", "#E4572E"
+PURPLE, MAGENTA, INK = "#7D4FBF", "#D81E5B", "#14231C"
+PAPER, SURFACE = "#F6F5EF", "#FFFFFF"
 
-STAGES = ["Materials", "Manufacturing", "Distribution", "Use phase", "End-of-life", "Credits"]
-STAGE_COLORS = {
-    "Materials": "#0D9488", "Manufacturing": "#65A30D", "Distribution": "#2563EB",
-    "Use phase": "#D97706", "End-of-life": "#7C3AED", "Credits": "#DB2777",
-}
-STATUS_LABEL = {
-    "draft": "Draft", "validated": "Validated", "in_review": "In review",
-    "approved": "Approved", "changes_requested": "Changes requested", "archived": "Archived",
-}
-EDITABLE = {"draft", "validated", "changes_requested"}
-QW = {"measured": 1.0, "supplier": 0.8, "proxy": 0.55}
+STAGES = ["Raw materials", "Manufacturing", "Transport", "Use phase", "End of life"]
+STAGE_COLORS = {"Raw materials": LEAF, "Manufacturing": AMBER, "Transport": SKY,
+                "Use phase": PURPLE, "End of life": TERRA}
+SERIES = [FOREST, LEAF, SKY, AMBER, MAGENTA, PURPLE, TERRA, "#5B8C5A"]
 
-ROLES = ["Administrator", "Analyst", "Reviewer", "Stakeholder"]
-ALL_ACTIONS = {"edit", "import", "validate", "submit", "approve", "reopen", "archive",
-               "override", "delete", "factors", "reset", "scenario", "export"}
+STATUSES = ["Draft", "Validated", "In Review", "Approved", "Changes Requested", "Archived"]
+STATUS_COLORS = {"Draft": "#5C665F", "Validated": SKY, "In Review": AMBER,
+                 "Approved": LEAF, "Changes Requested": TERRA, "Archived": "#6B705C"}
+QUALITY_SIGMA = {"measured": 0.05, "estimated": 0.15, "proxy": 0.30}
+QUALITY_SCORE = {"measured": 1.0, "estimated": 0.7, "proxy": 0.4}
+FACTOR_SIGMA = 0.10
+EOL_RECOVERY = 0.90
+KWH_TO_MJ = 3.6  # documented physical conversion (electricity CED uses grid primary factors)
+
+USERS = {"Administrator": "Morgan Diaz", "Analyst": "Ava Chen",
+         "Reviewer": "Dr. Ravi Patel", "Stakeholder": "Sam Lee"}
 PERMS = {
-    "Administrator": set(ALL_ACTIONS),
-    "Analyst": {"edit", "import", "validate", "submit", "scenario", "export"},
-    "Reviewer": {"approve", "reopen", "override", "export"},
-    "Stakeholder": {"export"},
+    "Administrator": {"view", "edit", "create", "delete", "submit", "approve", "override",
+                      "archive", "export", "factors", "restore", "reset"},
+    "Analyst": {"view", "edit", "create", "delete", "submit", "export"},
+    "Reviewer": {"view", "approve", "override", "export"},
+    "Stakeholder": {"view", "export_approved"},
 }
-TRANSITIONS = {
-    ("draft", "validated"): "validate",
-    ("changes_requested", "validated"): "validate",
-    ("validated", "in_review"): "submit",
-    ("in_review", "approved"): "approve",
-    ("in_review", "changes_requested"): "approve",
-    ("approved", "draft"): "reopen",
-    ("archived", "draft"): "reopen",
-    ("approved", "archived"): "archive",
-}
+TRANSITIONS = {"Draft": ["Validated"], "Validated": ["In Review", "Draft"],
+               "In Review": ["Approved", "Changes Requested"],
+               "Changes Requested": ["Draft", "Validated"],
+               "Approved": ["Archived", "Draft"], "Archived": ["Draft"]}
+ACTION_PERM = {"Validated": "submit", "In Review": "submit", "Approved": "approve",
+               "Changes Requested": "approve", "Archived": "archive", "Draft": "edit"}
+ACTION_VERB = {"Validated": "validate", "In Review": "submit", "Approved": "approve",
+               "Changes Requested": "request_changes", "Archived": "archive", "Draft": "reopen"}
 
-MATERIALS = {
-    "steel":     {"name": "Steel, section & sheet",   "gwp": 2.46, "rec": 0.68, "unc": 25, "incin": 0.02, "land": 0.03, "recyclable": True},
-    "stainless": {"name": "Stainless steel",          "gwp": 6.15, "rec": 1.80, "unc": 30, "incin": 0.02, "land": 0.03, "recyclable": True},
-    "aluminium": {"name": "Aluminium, wrought",       "gwp": 12.5, "rec": 0.92, "unc": 30, "incin": 0.02, "land": 0.03, "recyclable": True},
-    "copper":    {"name": "Copper, cathode/wire",     "gwp": 3.00, "rec": 0.60, "unc": 25, "incin": 0.02, "land": 0.03, "recyclable": True},
-    "brass":     {"name": "Brass, machined",          "gwp": 4.50, "rec": 1.10, "unc": 35, "incin": 0.02, "land": 0.03, "recyclable": True},
-    "abs":       {"name": "ABS plastic",              "gwp": 3.80, "rec": 1.20, "unc": 25, "incin": 2.90, "land": 0.05, "recyclable": True},
-    "pp":        {"name": "Polypropylene",            "gwp": 1.95, "rec": 0.90, "unc": 25, "incin": 2.70, "land": 0.05, "recyclable": True},
-    "pet":       {"name": "PET plastic",              "gwp": 2.70, "rec": 1.10, "unc": 25, "incin": 2.30, "land": 0.05, "recyclable": True},
-    "rubber":    {"name": "Rubber, tyre compound",    "gwp": 3.20, "rec": 1.40, "unc": 30, "incin": 2.40, "land": 0.05, "recyclable": True},
-    "glass":     {"name": "Glass, technical",         "gwp": 0.85, "rec": 0.55, "unc": 20, "incin": 0.01, "land": 0.02, "recyclable": True},
-    "cardboard": {"name": "Cardboard packaging",      "gwp": 0.90, "rec": 0.60, "unc": 20, "incin": 0.10, "land": 0.60, "recyclable": True},
-    "pcb":       {"name": "Printed circuit board",    "gwp": 28.0, "rec": None, "unc": 45, "incin": 0.80, "land": 0.04, "recyclable": False},
-    "libatt":    {"name": "Li-ion battery cell",      "gwp": 7.50, "rec": None, "unc": 40, "incin": 0.60, "land": 0.05, "recyclable": False},
-}
-PROCESS = {
-    "grid":      {"name": "Electricity, grid mix",     "unit": "kWh",  "gwp": 0.380, "unc": 15},
-    "gas":       {"name": "Natural gas, process heat", "unit": "kWh",  "gwp": 0.202, "unc": 10},
-    "truck":     {"name": "Road freight, HGV",         "unit": "t·km", "gwp": 0.110, "unc": 25},
-    "rail":      {"name": "Rail freight",              "unit": "t·km", "gwp": 0.028, "unc": 30},
-    "sea":       {"name": "Sea freight, container",    "unit": "t·km", "gwp": 0.016, "unc": 30},
-    "air":       {"name": "Air freight, long-haul",    "unit": "t·km", "gwp": 0.600, "unc": 40},
-    "reprocess": {"name": "Recycling reprocessing",    "unit": "kg",   "gwp": 0.080, "unc": 50},
-}
-FACTOR_VERSIONS = {
-    "FCT-2026.1": {"label": "Current · demo baseline", "overrides": {}},
-    "FCT-2025.2": {"label": "Previous · rollback candidate", "overrides": {
-        "steel.gwp": 2.62, "aluminium.gwp": 13.4, "pcb.gwp": 24.0,
-        "grid.gwp": 0.42, "truck.gwp": 0.121, "libatt.gwp": 8.4}},
-}
+# ══════════════════════════════ REFERENCE FACTORS (SYNTHETIC) ══════════════════════════════
+def base_factors() -> dict:
+    """Illustrative synthetic factors — NOT a licensed LCA database. ghg: kg CO2e/unit,
+    mj: MJ/unit. ghg_rec == ghg means no established recycling credit pathway."""
+    return {
+        "materials": {
+            "Steel":                  {"ghg": 2.10, "ghg_rec": 0.70, "mj": 25.0, "mj_rec": 9.0,  "incin": 0.0, "landfill": 0.02},
+            "Aluminium":              {"ghg": 11.0, "ghg_rec": 1.20, "mj": 155.0,"mj_rec": 18.0, "incin": 0.0, "landfill": 0.02},
+            "Copper":                 {"ghg": 3.20, "ghg_rec": 0.90, "mj": 45.0, "mj_rec": 12.0, "incin": 0.0, "landfill": 0.02},
+            "Brass":                  {"ghg": 3.50, "ghg_rec": 1.10, "mj": 50.0, "mj_rec": 16.0, "incin": 0.0, "landfill": 0.02},
+            "Glass":                  {"ghg": 1.10, "ghg_rec": 0.70, "mj": 15.0, "mj_rec": 10.0, "incin": 0.0, "landfill": 0.02},
+            "ABS plastic":            {"ghg": 3.40, "ghg_rec": 1.10, "mj": 80.0, "mj_rec": 30.0, "incin": 2.9, "landfill": 0.01},
+            "PET":                    {"ghg": 2.80, "ghg_rec": 1.00, "mj": 70.0, "mj_rec": 28.0, "incin": 2.3, "landfill": 0.01},
+            "PUR foam":               {"ghg": 4.20, "ghg_rec": 4.20, "mj": 95.0, "mj_rec": 95.0, "incin": 2.6, "landfill": 0.02},
+            "Rubber":                 {"ghg": 2.90, "ghg_rec": 1.40, "mj": 60.0, "mj_rec": 25.0, "incin": 2.8, "landfill": 0.02},
+            "Cardboard":              {"ghg": 0.90, "ghg_rec": 0.50, "mj": 18.0, "mj_rec": 10.0, "incin": 1.1, "landfill": 0.90},
+            "Concrete":               {"ghg": 0.13, "ghg_rec": 0.10, "mj": 1.2,  "mj_rec": 1.0,  "incin": 0.0, "landfill": 0.01},
+            "Li-ion battery":         {"ghg": 12.5, "ghg_rec": 8.00, "mj": 160.0,"mj_rec": 100.0,"incin": 1.0, "landfill": 0.10},
+            "PCB / electronics":      {"ghg": 38.0, "ghg_rec": 38.0, "mj": 400.0,"mj_rec": 400.0,"incin": 1.2, "landfill": 0.05},
+            "LED module":             {"ghg": 28.0, "ghg_rec": 28.0, "mj": 320.0,"mj_rec": 320.0,"incin": 1.2, "landfill": 0.05},
+            "Recycled plastic lumber":{"ghg": 1.10, "ghg_rec": 0.90, "mj": 20.0, "mj_rec": 16.0, "incin": 2.3, "landfill": 0.01},
+        },
+        "grids": {
+            "EU average":   {"ghg": 0.380, "mj": 9.5},
+            "US average":   {"ghg": 0.420, "mj": 10.2},
+            "China":        {"ghg": 0.580, "mj": 13.0},
+            "Nordic hydro": {"ghg": 0.060, "mj": 1.5},
+            "On-site solar":{"ghg": 0.045, "mj": 1.2},
+        },
+        "transport": {  # per tonne-km
+            "Sea freight": {"ghg": 0.016, "mj": 0.22},
+            "Rail":        {"ghg": 0.028, "mj": 0.38},
+            "Truck (HGV)": {"ghg": 0.110, "mj": 1.50},
+            "Air freight": {"ghg": 0.600, "mj": 8.50},
+        },
+    }
 
-DEFAULT_PARAMS = {
-    "volume_mult": 1.0, "grid": 0.38, "use_mult": 1.0, "life_mult": 1.0,
-    "dist_mult": 1.0, "air_share": 4, "recycled_content": 25, "eol_recycle": 55,
-    "incin_share": 40, "scrap": 6, "mc_runs": 1500, "seed": 42,
-}
-PARAM_BOUNDS = {
-    "volume_mult": (0.2, 3.0, 0.05), "grid": (0.02, 0.90, 0.01),
-    "use_mult": (0.2, 2.0, 0.05), "life_mult": (0.5, 2.0, 0.05),
-    "dist_mult": (0.2, 3.0, 0.05), "air_share": (0, 30, 1),
-    "recycled_content": (0, 100, 5), "eol_recycle": (0, 95, 5),
-    "incin_share": (0, 100, 5), "scrap": (0, 20, 1),
-    "mc_runs": (200, 5000, 100), "seed": (0, 999999, 1),
-}
+MATERIAL_NAMES = list(base_factors()["materials"])
+GRID_NAMES = list(base_factors()["grids"])
+TRANSPORT_NAMES = list(base_factors()["transport"])
 
-
-def resolve_factors(version):
-    m, p = copy.deepcopy(MATERIALS), copy.deepcopy(PROCESS)
-    for key, val in FACTOR_VERSIONS.get(version, {}).get("overrides", {}).items():
-        name, field = key.split(".")
-        if name in m:
-            m[name][field] = val
-        elif name in p:
-            p[name][field] = val
-    return {"version": version, "materials": m, "process": p}
-
-
-def utcnow():
+# ══════════════════════════════ SMALL UTILITIES ══════════════════════════════
+def utcnow() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
+def days_ago(n: float) -> str:
+    return (datetime.now(timezone.utc) - timedelta(days=n)).isoformat(timespec="seconds")
 
-# ============================================================================
-# DOMAIN ENGINE
-# ============================================================================
-def assess(prod, lines, legs, params, factors, overrides=None):
-    overrides = overrides or []
-    if prod["lifetime_yr"] <= 0:
-        raise ValueError("lifetime_yr must be > 0")
-    if prod["use_kwh_yr"] < 0 or prod["assembly_kwh"] < 0 or prod["gas_kwh"] < 0:
-        raise ValueError("Energy inputs must be >= 0")
-    if not (0 < params["grid"] <= 2):
-        raise ValueError("Grid intensity out of range (0–2 kg CO2e/kWh)")
-    mat, proc = factors["materials"], factors["process"]
-    rows = []
+def uid() -> str:
+    return uuid.uuid4().hex[:8].upper()
 
-    def add(stage, item, qty, qu, code, fv, fu, gwp, unc, quality, formula):
-        rows.append({"stage": stage, "item": item, "qty": float(qty), "qty_unit": qu,
-                     "code": code, "factor": float(fv), "factor_unit": fu,
-                     "gwp": float(gwp), "unc_pct": float(unc), "quality": quality,
-                     "formula": formula})
+def sha256_text(t: str) -> str:
+    return hashlib.sha256(t.encode("utf-8", "replace")).hexdigest()
 
-    rc = params["recycled_content"] / 100.0
-    total_mass = mat_embodied = qsum = 0.0
-    for ln in lines:
-        code = str(ln["material_code"]).strip().lower()
-        if code not in mat:
-            raise ValueError(f"Unknown material code '{code}' — not in factor catalog")
-        mass = float(ln["mass_kg"])
-        if not math.isfinite(mass) or mass <= 0 or mass > 5000:
-            raise ValueError(f"Line '{code}': mass_kg must be a number in (0, 5000]")
-        m = mat[code]
-        r = rc if (m["recyclable"] and m["rec"] is not None) else 0.0
-        ef = m["gwp"] * (1 - r) + (m["rec"] if m["rec"] is not None else m["gwp"]) * r
-        g = mass * ef
-        total_mass += mass
-        mat_embodied += g
-        qsum += mass * QW.get(ln.get("quality", "proxy"), 0.55)
-        add("Materials", m["name"], mass, "kg", code, ef, "kg CO₂e/kg", g, m["unc"],
-            ln.get("quality", "proxy"),
-            f"{mass:.3f} kg × {ef:.2f} kg/kg (recycled content {r*100:.0f}%)")
+def _num(x, default=0.0) -> float:
+    try:
+        v = float(x)
+        return v if math.isfinite(v) else default
+    except (TypeError, ValueError):
+        return default
 
-    scrap = min(params["scrap"] / 100.0, 0.95)
-    extra = total_mass * scrap / (1 - scrap)
-    avg_ef = mat_embodied / total_mass if total_mass else 0.0
-    add("Manufacturing", "Process scrap (upstream burden)", extra, "kg", "mat_avg",
-        avg_ef, "kg CO₂e/kg", extra * avg_ef, 30, "estimate",
-        f"{total_mass:.2f} kg × {scrap:.0%} ÷ (1−{scrap:.0%}) × {avg_ef:.2f} kg/kg")
-    grid, gu = params["grid"], proc["grid"]["unc"]
-    add("Manufacturing", "Assembly electricity", prod["assembly_kwh"], "kWh", "grid",
-        grid, "kg CO₂e/kWh", prod["assembly_kwh"] * grid, gu, "supplier",
-        f"{prod['assembly_kwh']:.1f} kWh × {grid:.2f} kg/kWh")
-    add("Manufacturing", "Process heat (natural gas)", prod["gas_kwh"], "kWh", "gas",
-        proc["gas"]["gwp"], "kg CO₂e/kWh", prod["gas_kwh"] * proc["gas"]["gwp"],
-        proc["gas"]["unc"], "supplier",
-        f"{prod['gas_kwh']:.1f} kWh × {proc['gas']['gwp']:.3f} kg/kWh")
+def fmt(x) -> str:  return f"{_num(x):,.1f}"
+def fmt0(x) -> str: return f"{_num(x):,.0f}"
 
-    mass_t = total_mass / 1000.0
-    has_outbound = any(l["scope"] == "outbound" for l in legs)
-    for leg in legs:
-        mode = leg["mode"]
-        if mode not in proc:
-            raise ValueError(f"Unknown transport mode '{mode}'")
-        km = float(leg["km"]) * params["dist_mult"]
-        if km < 0 or km > 60000:
-            raise ValueError("Transport distance out of range (0–60,000 km)")
-        share = (1 - params["air_share"] / 100.0) if leg["scope"] == "outbound" else 1.0
-        tk = mass_t * km * share
-        add("Distribution", f"{leg['scope'].title()} · {proc[mode]['name']}", tk, "t·km",
-            mode, proc[mode]["gwp"], "kg CO₂e/t·km", tk * proc[mode]["gwp"],
-            proc[mode]["unc"], "estimate",
-            f"{mass_t:.4f} t × {km:,.0f} km × {share:.0%} modal share")
-    if has_outbound and params["air_share"] > 0:
-        tk = mass_t * AIR_KM * params["dist_mult"] * params["air_share"] / 100.0
-        add("Distribution", "Outbound · Air freight (expedited share)", tk, "t·km", "air",
-            proc["air"]["gwp"], "kg CO₂e/t·km", tk * proc["air"]["gwp"], proc["air"]["unc"],
-            "estimate", f"{mass_t:.4f} t × {AIR_KM:,} km × {params['air_share']}% air")
-
-    life = prod["lifetime_yr"] * params["life_mult"]
-    use_kwh = prod["use_kwh_yr"] * params["use_mult"] * life
-    add("Use phase", "Operating electricity", use_kwh, "kWh", "grid", grid,
-        "kg CO₂e/kWh", use_kwh * grid, gu, "estimate",
-        f"{prod['use_kwh_yr']:,.1f} kWh/yr × {life:.1f} yr × {grid:.2f} kg/kWh")
-
-    er, inc_s = params["eol_recycle"] / 100.0, params["incin_share"] / 100.0
-    for ln in lines:
-        m = mat[str(ln["material_code"]).strip().lower()]
-        mass = float(ln["mass_kg"])
-        r = er if m["recyclable"] else 0.0
-        mr = mass * r
-        rem = mass - mr
-        inc = rem * inc_s
-        land = rem - inc
-        if mr > 0:
-            add("End-of-life", f"Recycling reprocessing — {m['name']}", mr, "kg",
-                "reprocess", proc["reprocess"]["gwp"], "kg CO₂e/kg",
-                mr * proc["reprocess"]["gwp"], proc["reprocess"]["unc"], "estimate",
-                f"{mr:.3f} kg × {proc['reprocess']['gwp']:.2f} kg/kg")
-            if m["rec"] is not None:
-                cf = -(m["gwp"] - m["rec"]) * CREDIT_QUALITY
-                add("Credits", f"Avoided virgin material — {m['name']}", mr, "kg",
-                    str(ln["material_code"]).strip().lower(), cf, "kg CO₂e/kg", mr * cf,
-                    m["unc"], "estimate",
-                    f"−{mr:.3f} kg × ({m['gwp']:.2f} − {m['rec']:.2f}) × {CREDIT_QUALITY}")
-        if inc > 0:
-            add("End-of-life", f"Incineration — {m['name']}", inc, "kg",
-                str(ln["material_code"]).strip().lower(), m["incin"], "kg CO₂e/kg",
-                inc * m["incin"], 30, "estimate", f"{inc:.3f} kg × {m['incin']:.2f} kg/kg")
-        if land > 0:
-            add("End-of-life", f"Landfill — {m['name']}", land, "kg",
-                str(ln["material_code"]).strip().lower(), m["land"], "kg CO₂e/kg",
-                land * m["land"], 40, "estimate", f"{land:.3f} kg × {m['land']:.2f} kg/kg")
-
-    for o in overrides:
-        add(o["stage"], f"Manual override — {o['reason'][:60]}", o["delta_kg"],
-            "kg CO₂e", "override", 1.0, "adjustment", o["delta_kg"], 0, "override",
-            f"Reviewer adjustment by {o['actor']} at {o['ts']}")
-
-    df = pd.DataFrame(rows)
-    stages = df.groupby("stage")["gwp"].sum().reindex(STAGES, fill_value=0.0).to_dict()
-    total = float(df["gwp"].sum())
-    quality = qsum / total_mass if total_mass else 0.0
-    proxy_mass = sum(float(l["mass_kg"]) for l in lines if l.get("quality") == "proxy")
-    flags = [("info", "Illustrative demo factor set — replace with a licensed database before external reporting.")]
-    if total_mass and proxy_mass / total_mass > 0.25:
-        flags.append(("warning", f"{proxy_mass/total_mass:.0%} of BOM mass uses proxy factors — request supplier declarations."))
-    if any(mat[str(l['material_code']).strip().lower()]["unc"] >= 40 for l in lines):
-        flags.append(("warning", "High-uncertainty inputs present (electronics / battery, ±40–45%)."))
-    if any(not str(l.get("supplier", "")).strip() for l in lines):
-        flags.append(("warning", "Some BOM lines are missing a supplier name — provenance incomplete."))
-    if any(not mat[str(l['material_code']).strip().lower()]["recyclable"] for l in lines):
-        flags.append(("info", "Electronics/battery recycling credits are not modeled in the MVP (conservative)."))
-    volume = prod["base_volume"] * params["volume_mult"]
-    return {"rows": df, "stages": stages, "total": total, "mass": total_mass,
-            "quality": quality, "flags": flags, "volume": volume,
-            "annual": total * volume, "proxy_share": (proxy_mass / total_mass) if total_mass else 0.0}
-
-
-def monte_carlo(res, factors, n, seed):
-    grp = res["rows"].groupby("code")["gwp"].sum()
-    codes, base = list(grp.index), grp.values.astype(float)
-    sig = []
-    for c in codes:
-        if c in factors["materials"]:
-            u = factors["materials"][c]["unc"]
-        elif c in factors["process"]:
-            u = factors["process"][c]["unc"]
-        elif c == "mat_avg":
-            u = 30.0
-        else:
-            u = 0.0
-        sig.append(u / 100.0 / 1.96)
-    rng = np.random.default_rng(int(seed))
-    draws = rng.lognormal(0.0, np.array(sig), size=(int(n), len(codes)))
-    totals = draws @ base
-    p5, p50, p95 = np.percentile(totals, [5, 50, 95])
-    return {"samples": totals, "p5": float(p5), "p50": float(p50), "p95": float(p95),
-            "mean": float(totals.mean()), "std": float(totals.std()), "n": int(n)}
-
-
-def tornado(prod, lines, legs, params, factors, overrides):
-    drivers = [("Grid carbon intensity", "grid", "rel", 0.2),
-               ("Use-phase energy", "use_mult", "rel", 0.2),
-               ("Service lifetime", "life_mult", "rel", 0.2),
-               ("Transport distance", "dist_mult", "rel", 0.2),
-               ("Recycled content", "recycled_content", "pp", 15),
-               ("EoL recycling rate", "eol_recycle", "pp", 15),
-               ("Air freight share", "air_share", "pp", 4),
-               ("Manufacturing scrap", "scrap", "pp", 3)]
-    base = assess(prod, lines, legs, params, factors, overrides)["total"]
-    out = []
-    for label, key, mode, amt in drivers:
-        lo, hi, _ = PARAM_BOUNDS[key]
-        v = params[key]
-        vlo = v * (1 - amt) if mode == "rel" else v - amt
-        vhi = v * (1 + amt) if mode == "rel" else v + amt
-        plo, phi = dict(params), dict(params)
-        plo[key] = max(lo, min(hi, vlo))
-        phi[key] = max(lo, min(hi, vhi))
-        out.append({"driver": label,
-                    "low": assess(prod, lines, legs, plo, factors, overrides)["total"] - base,
-                    "high": assess(prod, lines, legs, phi, factors, overrides)["total"] - base})
-    df = pd.DataFrame(out)
-    df["span"] = df[["low", "high"]].abs().max(axis=1)
-    return df.sort_values("span"), base
-
-
-def validate_product(prod, lines, legs, factors):
-    checks = []
-
-    def err(m): checks.append({"level": "error", "msg": m})
-    def warn(m): checks.append({"level": "warning", "msg": m})
-    def ok(m): checks.append({"level": "ok", "msg": m})
-
-    if not lines:
-        err("BOM is empty — add at least one material line.")
-    seen = set()
-    proxy = total = 0.0
-    for ln in lines:
-        code = str(ln["material_code"]).strip().lower()
-        if code not in factors["materials"]:
-            err(f"Unknown material '{code}' — not in factor catalog.")
-        if code in seen:
-            err(f"Duplicate BOM material '{code}'.")
-        seen.add(code)
-        try:
-            mass = float(ln["mass_kg"])
-            if not math.isfinite(mass) or mass <= 0 or mass > 5000:
-                err(f"'{code}': mass must be in (0, 5000] kg.")
-            else:
-                total += mass
-                if ln.get("quality") == "proxy":
-                    proxy += mass
-        except (TypeError, ValueError):
-            err(f"'{code}': mass_kg is not numeric.")
-        if ln.get("quality") not in QW:
-            err(f"'{code}': quality must be measured / supplier / proxy.")
-        if not str(ln.get("supplier", "")).strip():
-            warn(f"'{code}': supplier missing — provenance incomplete.")
-    if prod["lifetime_yr"] <= 0 or prod["lifetime_yr"] > 50:
-        err("Lifetime must be in (0, 50] years.")
-    if prod["use_kwh_yr"] < 0 or prod["use_kwh_yr"] > 100000:
-        err("Use-phase energy out of range (0–100,000 kWh/yr).")
-    if prod["base_volume"] < 1:
-        err("Annual volume must be >= 1 unit.")
-    for leg in legs:
-        if leg["mode"] not in ("truck", "rail", "sea", "air"):
-            err(f"Unknown transport mode '{leg['mode']}'.")
-        if float(leg["km"]) < 0 or float(leg["km"]) > 40000:
-            err("Transport distance out of range (0–40,000 km).")
-    score = 0.0
-    if total:
-        score = sum(float(l["mass_kg"]) * QW.get(l.get("quality"), 0.55)
-                    for l in lines if str(l.get("quality")) in QW) / total
-    if total and proxy / total > 0.25:
-        warn(f"{proxy/total:.0%} proxy mass — below supplier-data ambition.")
-    errors = [c for c in checks if c["level"] == "error"]
-    if not errors:
-        ok(f"All structural checks passed · {len(lines)} BOM lines · {total:.2f} kg.")
-    gate = (not errors) and score >= QUALITY_GATE
-    if not errors and not gate:
-        warn(f"Data-quality score {score*100:.0f} < gate {QUALITY_GATE*100:.0f} — submission requires a documented exception.")
-    return checks, score, gate
-
-
-IMPORT_COLS = ["material_code", "mass_kg", "supplier", "quality"]
-TEMPLATE_CSV = ("material_code,mass_kg,supplier,quality\n"
-                "aluminium,2.50,AluCycle SA,supplier\n"
-                "steel,1.20,ArcelorDemo Mill,measured\n"
-                "abs,0.40,PolyNord GmbH,proxy\n")
-BAD_CSV = ("material_code,mass_kg,supplier,quality\n"
-           "steel,1.20,ArcelorDemo Mill,measured\n"
-           "unobtanium,0.50,Unknown Co,supplier\n"
-           "aluminium,-2.0,AluCycle SA,supplier\n"
-           "copper,abc,,supplier\n"
-           "abs,0.40,PolyNord GmbH,guess\n"
-           "steel,0.80,Duplicate Mill,measured\n"
-           "pcb,0.05,,proxy\n"
-           ",0.30,NoCode Ltd,measured\n")
-
-
-def validate_import(df, existing_codes, mode, factors):
-    out = df.copy()
-    statuses, errors = [], []
-    seen = set()
-    for _, row in out.iterrows():
-        errs = []
-        code = str(row.get("material_code", "") or "").strip().lower()
-        if not code or code == "nan":
-            errs.append("material_code is required")
-        elif code not in factors["materials"]:
-            sug = difflib.get_close_matches(code, list(factors["materials"]), n=2)
-            errs.append(f"unknown material '{code}'" + (f" — did you mean {sug}?" if sug else " — see factor catalog"))
-        mass = pd.to_numeric(row.get("mass_kg"), errors="coerce")
-        if pd.isna(mass):
-            errs.append("mass_kg must be a number")
-        elif mass <= 0:
-            errs.append("mass_kg must be > 0")
-        elif mass > 5000:
-            errs.append("mass_kg out of range (0–5000]")
-        q = str(row.get("quality", "") or "").strip().lower()
-        if q not in QW:
-            errs.append("quality must be measured / supplier / proxy")
-        if code and code in seen:
-            errs.append("duplicate material_code within file")
-        if mode == "Append" and code and code in existing_codes:
-            errs.append("material already in BOM — use Replace mode or edit the BOM")
-        if code:
-            seen.add(code)
-        statuses.append("error" if errs else "valid")
-        errors.append("; ".join(errs))
-    out["_status"] = statuses
-    out["_errors"] = errors
-    return out
-
-
-# ============================================================================
-# DATA LAYER
-# ============================================================================
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS products(
-  id TEXT PRIMARY KEY, name TEXT, category TEXT, description TEXT,
-  functional_unit TEXT, status TEXT, lifetime_yr REAL, use_kwh_yr REAL,
-  assembly_kwh REAL, gas_kwh REAL, base_volume INTEGER,
-  created_at TEXT, updated_at TEXT, created_by TEXT, source TEXT, schema_version INTEGER);
-CREATE TABLE IF NOT EXISTS bom_lines(
-  id INTEGER PRIMARY KEY AUTOINCREMENT, product_id TEXT REFERENCES products(id) ON DELETE CASCADE,
-  material_code TEXT, mass_kg REAL, supplier TEXT, quality TEXT,
-  created_at TEXT, updated_at TEXT, source TEXT);
-CREATE TABLE IF NOT EXISTS transport_legs(
-  id INTEGER PRIMARY KEY AUTOINCREMENT, product_id TEXT REFERENCES products(id) ON DELETE CASCADE,
-  scope TEXT, mode TEXT, km REAL, created_at TEXT);
-CREATE TABLE IF NOT EXISTS audit_events(
-  id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, actor TEXT, role TEXT,
-  event TEXT, entity TEXT, entity_id TEXT, details TEXT);
-CREATE TABLE IF NOT EXISTS approvals(
-  id INTEGER PRIMARY KEY AUTOINCREMENT, product_id TEXT, ts TEXT, actor TEXT, role TEXT,
-  from_status TEXT, to_status TEXT, comment TEXT);
-CREATE TABLE IF NOT EXISTS scenarios(
-  id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, params_json TEXT,
-  created_at TEXT, actor TEXT, note TEXT);
-CREATE TABLE IF NOT EXISTS imports(
-  id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, product_id TEXT, filename TEXT,
-  sha256 TEXT, mode TEXT, rows_total INTEGER, rows_ok INTEGER, rows_err INTEGER, actor TEXT);
-CREATE TABLE IF NOT EXISTS overrides(
-  id INTEGER PRIMARY KEY AUTOINCREMENT, product_id TEXT, stage TEXT, delta_kg REAL,
-  reason TEXT, actor TEXT, role TEXT, ts TEXT, active INTEGER DEFAULT 1);
-CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
-"""
-
-
-def db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys=ON")
-    return conn
-
-
-def seed(c):
-    now = datetime.now(timezone.utc)
-    ts = lambda d=0: (now - timedelta(days=d)).isoformat(timespec="seconds")
-    prods = [
-        ("aqua-m2", "AquaSense M2 — Smart Water Meter", "Municipal IoT",
-         "Ultrasonic residential water meter with LoRa telemetry, battery powered.",
-         "1 metering unit · 10-year service life", "approved", 10, 0.06, 1.4, 0.3, 24000, ts(21), ts(2), "demo.seed", "synthetic://fixtures/v1"),
-        ("therma-200", "ThermaCore 200 — Heat-Pump Water Heater", "Building equipment",
-         "200 L integrated heat-pump water heater for residential retrofit programs.",
-         "1 heater · 200 L storage · 12-year life", "in_review", 12, 940, 46, 12, 1500, ts(14), ts(3), "demo.seed", "synthetic://fixtures/v1"),
-        ("city-ebike", "CityFlow E3 — Urban E-Bike", "Mobility",
-         "Step-through commuter e-bike, 500 Wh battery, belt drive, fleet-ready.",
-         "1 e-bike · 8-year / 12,000 km service", "draft", 8, 62, 18, 4, 5200, ts(1), ts(1), "demo.seed", "synthetic://fixtures/v1"),
-    ]
-    for p in prods:
-        c.execute("INSERT INTO products VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (*p, SCHEMA_VERSION))
-    boms = {
-        "aqua-m2": [("abs", 0.42, "PolyNord GmbH", "supplier"), ("pcb", 0.058, "", "proxy"),
-                    ("libatt", 0.092, "CellTech Ltd", "supplier"), ("copper", 0.048, "CuWire BV", "supplier"),
-                    ("brass", 0.185, "MetalWorks NV", "supplier"), ("stainless", 0.12, "MetalWorks NV", "supplier"),
-                    ("glass", 0.032, "", "proxy"), ("cardboard", 0.16, "LocalPack Co", "measured")],
-        "therma-200": [("steel", 38.5, "ArcelorDemo Mill", "measured"), ("stainless", 4.2, "MetalWorks NV", "supplier"),
-                       ("copper", 6.4, "CuWire BV", "supplier"), ("aluminium", 3.1, "AluCycle SA", "supplier"),
-                       ("abs", 2.6, "PolyNord GmbH", "supplier"), ("pp", 1.8, "", "proxy"),
-                       ("rubber", 0.9, "TyreTech Oy", "supplier"), ("glass", 0.2, "", "proxy"),
-                       ("cardboard", 2.4, "LocalPack Co", "measured")],
-        "city-ebike": [("aluminium", 9.6, "AluCycle SA", "supplier"), ("steel", 2.3, "ArcelorDemo Mill", "supplier"),
-                       ("libatt", 3.4, "CellTech Ltd", "supplier"), ("copper", 0.9, "", "proxy"),
-                       ("rubber", 1.9, "TyreTech Oy", "supplier"), ("abs", 1.1, "PolyNord GmbH", "supplier"),
-                       ("pp", 0.6, "", "proxy"), ("cardboard", 1.2, "LocalPack Co", "measured")],
-    }
-    for pid, lines in boms.items():
-        for code, mass, sup, q in lines:
-            c.execute("INSERT INTO bom_lines(product_id,material_code,mass_kg,supplier,quality,created_at,updated_at,source) VALUES (?,?,?,?,?,?,?,?)",
-                      (pid, code, mass, sup, q, ts(14), ts(1), "synthetic://fixtures/v1"))
-    legs = {
-        "aqua-m2": [("inbound", "sea", 8600), ("inbound", "truck", 420), ("outbound", "truck", 650), ("outbound", "rail", 180)],
-        "therma-200": [("inbound", "sea", 11200), ("inbound", "truck", 380), ("outbound", "truck", 900)],
-        "city-ebike": [("inbound", "sea", 14500), ("inbound", "truck", 520), ("outbound", "truck", 780), ("outbound", "rail", 260)],
-    }
-    for pid, ll in legs.items():
-        for scope, mode, km in ll:
-            c.execute("INSERT INTO transport_legs(product_id,scope,mode,km,created_at) VALUES (?,?,?,?,?)", (pid, scope, mode, km, ts(14)))
-    events = [
-        (ts(21), "demo.seed", "Administrator", "created", "product", "aqua-m2", "Synthetic fixture loaded"),
-        (ts(18), "Mira Chen", "Analyst", "validated", "product", "aqua-m2", "Structural checks passed"),
-        (ts(16), "Mira Chen", "Analyst", "submitted", "product", "aqua-m2", "Submitted for review"),
-        (ts(12), "Jonas Weber", "Reviewer", "approved", "product", "aqua-m2", "Approved for pilot reporting"),
-        (ts(14), "demo.seed", "Administrator", "created", "product", "therma-200", "Synthetic fixture loaded"),
-        (ts(3), "Mira Chen", "Analyst", "submitted", "product", "therma-200", "Submitted for review"),
-        (ts(1), "demo.seed", "Administrator", "created", "product", "city-ebike", "Synthetic fixture loaded"),
-    ]
-    c.executemany("INSERT INTO audit_events(ts,actor,role,event,entity,entity_id,details) VALUES (?,?,?,?,?,?,?)", events)
-    c.executemany("INSERT INTO approvals(product_id,ts,actor,role,from_status,to_status,comment) VALUES (?,?,?,?,?,?,?)", [
-        ("aqua-m2", ts(16), "Mira Chen", "Analyst", "validated", "in_review", "Submitted for review"),
-        ("aqua-m2", ts(12), "Jonas Weber", "Reviewer", "in_review", "approved", "Approved for pilot reporting"),
-        ("therma-200", ts(3), "Mira Chen", "Analyst", "validated", "in_review", "Submitted for review"),
-    ])
-    green = dict(DEFAULT_PARAMS, grid=0.12, recycled_content=60, eol_recycle=75, air_share=0)
-    c.execute("INSERT INTO scenarios(name,params_json,created_at,actor,note) VALUES (?,?,?,?,?)",
-              ("Green grid 2030", json.dumps(green), ts(5), "Mira Chen (Analyst)", "Decarbonized grid + circular materials"))
-    c.execute("INSERT OR IGNORE INTO settings VALUES ('factor_version','FCT-2026.1')")
-
-
-def init_db():
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-    with closing(db()) as c, c:
-        c.executescript(SCHEMA)
-        if c.execute("SELECT COUNT(*) FROM products").fetchone()[0] == 0:
-            seed(c)
-
-
-def qdf(sql, args=()):
-    with closing(db()) as c:
-        return pd.read_sql_query(sql, c, params=args)
-
-
-def log_event(c, actor, role, event, entity, entity_id, details):
-    c.execute("INSERT INTO audit_events(ts,actor,role,event,entity,entity_id,details) VALUES (?,?,?,?,?,?,?)",
-              (utcnow(), actor, role, event, entity, entity_id, details))
-
-
-def get_setting(key, default=None):
-    with closing(db()) as c:
-        r = c.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
-    return r[0] if r else default
-
-
-def require(role, action):
-    if action not in PERMS.get(role, set()):
-        raise PermissionError(f"Role '{role}' is not permitted to '{action}'.")
-
-
-def set_status(pid, to, actor, role, comment):
-    with closing(db()) as c, c:
-        cur = c.execute("SELECT status FROM products WHERE id=?", (pid,)).fetchone()
-        if cur is None:
-            raise ValueError("Product not found.")
-        cur = cur[0]
-        key = (cur, to)
-        if key not in TRANSITIONS:
-            raise ValueError(f"Invalid transition {cur} → {to}.")
-        require(role, TRANSITIONS[key])
-        c.execute("UPDATE products SET status=?, updated_at=? WHERE id=?", (to, utcnow(), pid))
-        c.execute("INSERT INTO approvals(product_id,ts,actor,role,from_status,to_status,comment) VALUES (?,?,?,?,?,?,?)",
-                  (pid, utcnow(), actor, role, cur, to, comment))
-        log_event(c, actor, role, to, "product", pid, comment or f"{cur} → {to}")
-
-
-def replace_bom(pid, rows, actor, role, source):
-    require(role, "edit")
-    with closing(db()) as c, c:
-        st_row = c.execute("SELECT status FROM products WHERE id=?", (pid,)).fetchone()[0]
-        if st_row not in EDITABLE:
-            raise ValueError("Record is locked — reopen it before editing.")
-        c.execute("DELETE FROM bom_lines WHERE product_id=?", (pid,))
-        for r in rows:
-            c.execute("INSERT INTO bom_lines(product_id,material_code,mass_kg,supplier,quality,created_at,updated_at,source) VALUES (?,?,?,?,?,?,?,?)",
-                      (pid, r["material_code"], r["mass_kg"], r["supplier"], r["quality"], utcnow(), utcnow(), source))
-        new_status = "draft" if st_row in ("validated", "changes_requested") else st_row
-        c.execute("UPDATE products SET status=?, updated_at=? WHERE id=?", (new_status, utcnow(), pid))
-        log_event(c, actor, role, "bom_updated", "product", pid, f"{len(rows)} lines · source={source}")
-
-
-def replace_legs(pid, rows, actor, role):
-    require(role, "edit")
-    with closing(db()) as c, c:
-        c.execute("DELETE FROM transport_legs WHERE product_id=?", (pid,))
-        for r in rows:
-            c.execute("INSERT INTO transport_legs(product_id,scope,mode,km,created_at) VALUES (?,?,?,?,?)",
-                      (pid, r["scope"], r["mode"], r["km"], utcnow()))
-        c.execute("UPDATE products SET updated_at=? WHERE id=?", (utcnow(), pid))
-        log_event(c, actor, role, "transport_updated", "product", pid, f"{len(rows)} legs")
-
-
-# ============================================================================
-# THEME — Field Ledger · Daylight
-# ============================================================================
-CSS = """
-@import url('https://fonts.googleapis.com/css2?family=Fraunces:wght@500;600;700&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500;600&display=swap');
-:root{
---paper:#F7F2E7;--paper2:#EFE7D6;--card:#FFFDF8;--overlay:#FFFDF8;
---ink:#16281F;--ink2:#31473B;--muted:#68796E;--line:#D9CFBA;--line2:#C7BBA0;
---evergreen:#123B2E;--evergreen2:#0C2A20;--leaf:#65A30D;--leafbright:#A8E63C;
---teal:#0D9488;--sky:#2563EB;--amber:#D97706;--red:#DC2626;--violet:#7C3AED;--pink:#DB2777;
---linkedin:#0A66C2;--linkedin2:#084D92;
-}
-*{scrollbar-width:thin;scrollbar-color:#2E5C49 #E8DFC9;}
-*::-webkit-scrollbar{width:11px;height:11px;}
-*::-webkit-scrollbar-track{background:#E8DFC9;}
-*::-webkit-scrollbar-thumb{background:#2E5C49;border-radius:8px;border:2px solid #E8DFC9;}
-*::-webkit-scrollbar-thumb:hover{background:var(--leaf);}
-.stApp{background-color:var(--paper);
-background-image:url('data:image/svg+xml;utf8,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 width=%22160%22 height=%22160%22%3E%3Cfilter id=%22n%22%3E%3CfeTurbulence type=%22fractalNoise%22 baseFrequency=%220.9%22 numOctaves=%222%22/%3E%3CfeColorMatrix type=%22saturate%22 values=%220%22/%3E%3C/filter%3E%3Crect width=%22160%22 height=%22160%22 filter=%22url(%23n)%22 opacity=%220.04%22/%3E%3C/svg%3E'),
-radial-gradient(900px 520px at 92% -10%,rgba(13,148,136,.16),transparent 62%),
-radial-gradient(820px 500px at -8% 14%,rgba(101,163,13,.13),transparent 58%),
-radial-gradient(900px 720px at 55% 112%,rgba(217,119,6,.11),transparent 62%);
-background-size:160px 160px,auto,auto,auto;background-repeat:repeat,no-repeat,no-repeat,no-repeat;
-color:var(--ink);font-family:Inter,system-ui,sans-serif;}
-.block-container{padding-top:1.1rem;padding-bottom:3rem;max-width:1440px;}
-#MainMenu,footer,[data-testid="stToolbar"]{visibility:hidden;}
-[data-testid="stHeader"]{background:transparent;}
-h1,h2,h3,h4{font-family:Fraunces,Georgia,serif;letter-spacing:-.015em;color:var(--ink);}
-[data-testid="stSidebar"]{background:linear-gradient(180deg,#0C2A20 0%,#123B2E 62%,#0E3327 100%);border-right:3px solid var(--leaf);}
-[data-testid="stSidebar"] *{color:#F3EEDF;}
-[data-testid="stSidebar"] h1,[data-testid="stSidebar"] h2,[data-testid="stSidebar"] h3{color:#F7F2E7;}
-[data-testid="stSidebar"] [data-testid="stCaptionContainer"]{color:#B9CDBF;}
-[data-testid="stCaptionContainer"]{color:var(--muted);}
-hr{border-color:var(--line);}
-.stButton>button,.stDownloadButton>button,[data-testid="stBaseButton-secondary"]{
-background:var(--card);border:1.5px solid var(--ink);color:var(--ink);border-radius:9px;
-font-weight:600;box-shadow:2px 2px 0 rgba(22,40,31,.13);transition:all .15s ease;}
-.stButton>button:hover,.stDownloadButton>button:hover,[data-testid="stBaseButton-secondary"]:hover{
-transform:translate(-1px,-1px);box-shadow:4px 4px 0 rgba(22,40,31,.17);border-color:var(--evergreen);color:var(--evergreen);}
-.stButton>button[kind="primary"],[data-testid="stBaseButton-primary"],
-button[kind="primaryFormSubmit"],[data-testid="stBaseButton-primaryFormSubmit"],
-button[kind="secondaryFormSubmit"]{
-background:var(--evergreen)!important;color:#F7F2E7!important;border-color:var(--evergreen)!important;font-weight:700;}
-.stButton>button[kind="primary"]:hover,[data-testid="stBaseButton-primary"]:hover,
-button[kind="primaryFormSubmit"]:hover{background:#1C5240!important;color:#F7F2E7!important;}
-.stButton>button:disabled,.stDownloadButton>button:disabled{opacity:.42;transform:none;box-shadow:2px 2px 0 rgba(22,40,31,.08);}
-.stLinkButton>a,[data-testid="stLinkButton"] a,[data-testid="stLinkButton"] button{
-background:var(--linkedin)!important;color:#FFFFFF!important;border:1.5px solid var(--linkedin)!important;
-border-radius:9px;font-weight:700;box-shadow:2px 2px 0 rgba(10,102,194,.25);text-decoration:none!important;}
-.stLinkButton>a:hover,[data-testid="stLinkButton"] a:hover,[data-testid="stLinkButton"] button:hover{
-background:var(--linkedin2)!important;color:#FFFFFF!important;transform:translate(-1px,-1px);}
-[data-baseweb="select"]>div,[data-baseweb="input"],[data-baseweb="textarea"]{
-background:var(--card)!important;border-color:var(--line2)!important;}
-[data-baseweb="select"] *,[data-baseweb="input"] input,[data-baseweb="textarea"] textarea{color:var(--ink)!important;}
-[data-baseweb="popover"] li{background:var(--card);color:var(--ink);}
-[data-baseweb="slider"] div[role="slider"]{background-color:var(--leaf)!important;box-shadow:0 0 0 4px rgba(101,163,13,.16);}
-div[style*="rgb(255, 75, 75)"],div[style*="rgb(255,75,75)"]{background-color:var(--leaf)!important;}
-input[type="checkbox"],input[type="radio"]{accent-color:var(--leaf);}
-label[data-baseweb="radio"] div[aria-checked="true"]{background:rgba(101,163,13,.14);}
-[data-baseweb="tab"]{color:var(--muted);} [data-baseweb="tab"][aria-selected="true"]{color:var(--evergreen)!important;}
-[data-baseweb="tab-highlight"]{background-color:var(--leaf)!important;}
-[data-baseweb="tab-border"]{background-color:var(--line2)!important;}
-[data-testid="stExpander"]{border:1.5px solid var(--line2);border-radius:12px;background:rgba(255,253,248,.75);}
-[data-testid="stExpander"] summary{color:var(--ink);}
-[data-testid="stAlert"]{border-radius:12px;}
-[data-testid="stDataFrame"],[data-testid="stDataEditor"]{background:var(--card);border-radius:12px;padding:6px;border:1.5px solid var(--line2);box-shadow:3px 3px 0 rgba(22,40,31,.06);}
-[data-testid="stSidebar"] [data-baseweb="select"]>div,
-[data-testid="stSidebar"] [data-baseweb="input"],
-[data-testid="stSidebar"] [data-baseweb="textarea"]{background:#0F2F24!important;border-color:#2E5C49!important;}
-[data-testid="stSidebar"] [data-baseweb="select"] *,
-[data-testid="stSidebar"] [data-baseweb="input"] input,
-[data-testid="stSidebar"] [data-baseweb="textarea"] textarea{color:#F3EEDF!important;}
-[data-testid="stSidebar"] .stButton>button{background:rgba(168,230,60,.10);border:1px solid #3E6B54;color:#F3EEDF;box-shadow:none;}
-[data-testid="stSidebar"] .stButton>button:hover{border-color:var(--leafbright);color:var(--leafbright);box-shadow:0 0 0 3px rgba(168,230,60,.12);}
-[data-testid="stSidebar"] [data-baseweb="slider"] div[role="slider"]{background-color:var(--leafbright)!important;}
-[data-testid="stSidebar"] div[style*="rgb(255, 75, 75)"],[data-testid="stSidebar"] div[style*="rgb(255,75,75)"]{background-color:var(--leafbright)!important;}
-.tt-brand{display:flex;gap:10px;align-items:center;margin-bottom:6px;}
-.tt-logo{width:38px;height:38px;border-radius:11px;background:linear-gradient(135deg,#A8E63C,#0D9488);
-display:flex;align-items:center;justify-content:center;font-size:1.2rem;color:#0C2A20;box-shadow:0 0 0 3px rgba(168,230,60,.15);}
-.tt-brand b{font-family:Fraunces,Georgia,serif;font-size:1.22rem;color:#F7F2E7;}
-.tt-brand small{display:block;color:#A8C4B0;font-size:.64rem;letter-spacing:.16em;text-transform:uppercase;}
-.tt-side-h{font:700 .66rem 'JetBrains Mono',monospace;letter-spacing:.2em;color:var(--leafbright);text-transform:uppercase;margin:14px 0 2px;}
-.tt-strip{display:flex;flex-wrap:wrap;gap:8px;align-items:center;justify-content:space-between;
-padding:10px 15px;border:1px solid #0A211A;border-radius:14px;color:#F3EEDF;
-background:linear-gradient(90deg,var(--evergreen2),var(--evergreen));box-shadow:4px 4px 0 rgba(22,40,31,.16);margin-bottom:18px;}
-.tt-strip .chip{border-color:rgba(243,238,223,.28);color:#CFE0D2;background:rgba(255,255,255,.04);}
-.tt-strip .chip.hot{color:#A8E63C;border-color:rgba(168,230,60,.55);}
-.chip{font-size:.68rem;padding:3px 10px;border-radius:999px;border:1px solid var(--line2);color:var(--muted);background:var(--card);letter-spacing:.04em;}
-.chip.hot{color:var(--leaf);border-color:rgba(101,163,13,.5);}
-.tt-share{display:inline-flex;align-items:center;gap:6px;background:var(--linkedin);color:#FFFFFF!important;
-border:1.5px solid #0A66C2;border-radius:9px;padding:5px 12px;font-size:.72rem;font-weight:700;
-letter-spacing:.03em;text-decoration:none!important;box-shadow:2px 2px 0 rgba(10,102,194,.3);transition:all .15s ease;white-space:nowrap;}
-.tt-share:hover{background:var(--linkedin2);color:#FFFFFF!important;transform:translate(-1px,-1px);box-shadow:3px 3px 0 rgba(10,102,194,.35);}
-.tt-share-side{width:100%;justify-content:center;margin-top:8px;padding:8px 12px;font-size:.78rem;}
-.tt-share-card{border:1.5px solid var(--line2);border-radius:14px;background:var(--card);padding:16px 18px;margin:8px 0 16px;box-shadow:4px 4px 0 rgba(22,40,31,.07);}
-.tt-share-card h4{margin:0 0 4px;font-size:1.05rem;}
-.tt-share-card p{margin:0 0 12px;color:var(--muted);font-size:.84rem;}
-.dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#A8E63C;margin-right:6px;animation:pulse 2s infinite;}
-@keyframes pulse{0%{box-shadow:0 0 0 0 rgba(168,230,60,.55)}70%{box-shadow:0 0 0 9px rgba(168,230,60,0)}100%{box-shadow:0 0 0 0 rgba(168,230,60,0)}}
-.tt-kicker{color:var(--teal);font:600 .7rem 'JetBrains Mono',monospace;letter-spacing:.24em;text-transform:uppercase;}
-.tt-hero{border-bottom:2px solid var(--line);padding-bottom:13px;animation:rise .4s ease both;}
-.tt-hero h1{font-size:2.25rem;margin:3px 0 7px;font-weight:600;}
-.tt-hero p{color:var(--muted);margin:0 0 10px;max-width:840px;font-size:.95rem;}
-@keyframes rise{from{opacity:0;transform:translateY(7px)}to{opacity:1;transform:none}}
-.tt-kpi-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin:16px 0 8px;}
-@media(max-width:1100px){.tt-kpi-grid{grid-template-columns:repeat(2,1fr);}}
-@media(max-width:640px){.tt-kpi-grid{grid-template-columns:1fr;}}
-.tt-kpi{position:relative;border:1.5px solid var(--line2);border-radius:14px;padding:16px 18px 14px;
-background:var(--card);overflow:hidden;box-shadow:4px 4px 0 rgba(22,40,31,.08);animation:rise .45s ease both;}
-.tt-kpi:nth-child(2){animation-delay:.05s}.tt-kpi:nth-child(3){animation-delay:.1s}.tt-kpi:nth-child(4){animation-delay:.15s}
-.tt-kpi::before{content:"";position:absolute;top:0;left:0;right:0;height:4px;background:var(--leaf);}
-.tt-kpi.a-teal::before{background:var(--teal);}.tt-kpi.a-amber::before{background:var(--amber);}.tt-kpi.a-sky::before{background:var(--sky);}
-.tt-kpi .l{font-size:.66rem;text-transform:uppercase;letter-spacing:.14em;color:var(--muted);font-family:'JetBrains Mono',monospace;}
-.tt-kpi .v{font:600 1.9rem Fraunces,Georgia,serif;color:var(--ink);margin:5px 0 3px;}
-.tt-kpi .s{font-size:.78rem;color:var(--ink2);}
-.b{padding:3px 10px;border-radius:999px;font-size:.66rem;font-weight:700;letter-spacing:.07em;text-transform:uppercase;border:1px solid;white-space:nowrap;}
-.b-draft{color:#5C6F63;border-color:#B9C4B4;background:#EEF1EA;}
-.b-validated{color:#1D4ED8;border-color:#BBD0F7;background:#EAF1FE;}
-.b-in_review{color:#B45309;border-color:#F3D19B;background:#FDF3E2;}
-.b-approved{color:#3F7A0E;border-color:#C4E39B;background:#F0F8E4;}
-.b-changes_requested{color:#B91C1C;border-color:#F5B5B5;background:#FDECEC;}
-.b-archived{color:#6D28D9;border-color:#D6C2F7;background:#F3EDFE;}
-.b-ok{color:#3F7A0E;border-color:#C4E39B;background:#F0F8E4;}
-.b-error{color:#B91C1C;border-color:#F5B5B5;background:#FDECEC;}
-.b-warning{color:#B45309;border-color:#F3D19B;background:#FDF3E2;}
-.b-info{color:#1D4ED8;border-color:#BBD0F7;background:#EAF1FE;}
-.tt-tablewrap{overflow:auto;border:1.5px solid var(--line2);border-radius:12px;margin:6px 0 12px;background:var(--card);box-shadow:3px 3px 0 rgba(22,40,31,.05);}
-table.tt{width:100%;border-collapse:collapse;font-size:.83rem;}
-table.tt th{position:sticky;top:0;background:var(--evergreen);color:#F3EEDF;text-transform:uppercase;
-font-size:.62rem;letter-spacing:.1em;padding:9px 12px;text-align:left;border-bottom:1px solid #0A211A;z-index:2;font-family:'JetBrains Mono',monospace;}
-table.tt td{padding:7px 12px;border-bottom:1px solid #E7DECB;color:var(--ink2);}
-table.tt tr:hover td{background:#F4F8EC;}
-table.tt td.num{text-align:right;font-variant-numeric:tabular-nums;}
-.tt-feed{list-style:none;padding:0;margin:0;}
-.tt-feed li{padding:9px 12px;border-left:3px solid var(--leaf);margin-bottom:7px;font-size:.82rem;color:var(--ink2);background:var(--card);border-radius:0 9px 9px 0;box-shadow:2px 2px 0 rgba(22,40,31,.05);}
-.tt-feed li b{color:var(--evergreen);} .tt-feed small{color:var(--muted);display:block;margin-top:2px;}
-.tt-note{border:1.5px dashed var(--line2);border-radius:12px;padding:11px 15px;color:var(--ink2);font-size:.83rem;margin:8px 0;background:#FBF7EC;}
-.delta-up{color:var(--red);font-weight:700;} .delta-down{color:var(--leaf);font-weight:700;}
-"""
-
-
-def width_kwargs(fn):
+def _w(fn) -> dict:
+    """Width kwarg compatible across Streamlit versions."""
     try:
         if "width" in inspect.signature(fn).parameters:
             return {"width": "stretch"}
@@ -777,1334 +149,1966 @@ def width_kwargs(fn):
         pass
     return {"use_container_width": True}
 
-
-def show_fig(fig, h=340, title=None, legend=True):
+def fig_layout(fig, height=340, title=None, **kw):
     fig.update_layout(
-        height=h, paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(255,253,248,.55)",
-        font=dict(family="Inter, sans-serif", color="#31473B", size=12),
-        margin=dict(l=10, r=10, t=46 if title else 16, b=10),
-        title=dict(text=title, font=dict(family="Fraunces, Georgia, serif", size=16, color="#16281F")) if title else None,
-        showlegend=legend, legend=dict(orientation="h", y=-0.16, font=dict(size=11, color="#31473B")),
-        hoverlabel=dict(bgcolor="#FFFDF8", font_color="#16281F", bordercolor="#123B2E"))
-    fig.update_xaxes(gridcolor="rgba(22,40,31,.10)", zerolinecolor="rgba(22,40,31,.25)", tickfont=dict(size=11, color="#5C6F63"))
-    fig.update_yaxes(gridcolor="rgba(22,40,31,.10)", zerolinecolor="rgba(22,40,31,.25)", tickfont=dict(size=11, color="#5C6F63"))
-    st.plotly_chart(fig, config={"displayModeBar": False}, **width_kwargs(st.plotly_chart))
+        template="plotly_white", height=height,
+        margin=dict(l=10, r=10, t=44 if title else 14, b=10),
+        font=dict(family="Inter, Segoe UI, sans-serif", color=INK, size=12),
+        title=dict(text=title, font=dict(family="Space Grotesk, Segoe UI, sans-serif", size=15)) if title else None,
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        legend=dict(orientation="h", y=-0.22), **kw)
+    return fig
 
+def pill(status: str) -> str:
+    return (f"<span style='background:{STATUS_COLORS.get(status, '#5C665F')};color:#fff;"
+            f"padding:3px 11px;border-radius:999px;font-size:12px;font-weight:700;"
+            f"white-space:nowrap'>{status}</span>")
 
-def badge(status):
-    return f'<span class="b b-{status}">{STATUS_LABEL.get(status, status)}</span>'
+def role_can(role: str, perm: str) -> bool:
+    return perm in PERMS.get(role, set())
 
+def can(perm: str) -> bool:
+    return role_can(st.session_state.role, perm)
 
-def html_table(df, badge_col=None, num_cols=(), max_h=420):
-    thead = "".join(f"<th>{htmlmod.escape(str(c))}</th>" for c in df.columns)
-    trs = []
-    for _, r in df.iterrows():
-        tds = []
-        for c in df.columns:
-            v = r[c]
-            if badge_col and c == badge_col:
-                cell = badge(str(v))
+def guard(perm: str):
+    if not can(perm):
+        raise PermissionError(f"Role '{st.session_state.role}' is not allowed to '{perm}'. Switch roles in the sidebar.")
+
+def current_user() -> str:
+    return USERS[st.session_state.role]
+
+def make_event(actor, role, action, entity, entity_id, details="", ts=None) -> dict:
+    return {"ts": ts or utcnow(), "actor": actor, "role": role, "action": action,
+            "entity": entity, "entity_id": entity_id, "details": details}
+
+def log_event(action, entity, entity_id, details=""):
+    st.session_state.db["audit"].append(
+        make_event(current_user(), st.session_state.role, action, entity, entity_id, details))
+
+def current_factors() -> dict:
+    db = st.session_state.db
+    return db["factor_versions"][db["factor_version"]]
+
+def active_products() -> list:
+    return [p for p in st.session_state.db["products"] if p["status"] != "Archived"]
+
+def product_by_id(pid):
+    return next((p for p in st.session_state.db["products"] if p["id"] == pid), None)
+
+def result_digest(r: dict) -> str:
+    return hashlib.sha256(json.dumps(r["lines"], sort_keys=True).encode()).hexdigest()[:16]
+
+def safe_results(p, factors):
+    try:
+        return compute_impacts(p, factors), None
+    except (ValueError, KeyError) as ex:
+        return None, str(ex)
+
+# ══════════════════════════════ DOMAIN ENGINE (UI-independent, deterministic) ══════════════════════════════
+def combine_sigma(q: str) -> float:
+    return math.sqrt(QUALITY_SIGMA.get(q, 0.30) ** 2 + FACTOR_SIGMA ** 2)
+
+def mk_line(stage, item, qty, unit, factor_id, factor_val, ghg, mj, quality, formula):
+    return {"stage": stage, "item": item, "qty": round(_num(qty), 6), "unit": unit,
+            "factor_id": factor_id, "factor": round(_num(factor_val), 6),
+            "ghg": float(ghg), "mj": float(mj), "quality": quality,
+            "sigma": combine_sigma(quality), "formula": formula}
+
+def compute_impacts(p: dict, factors: dict, mods: dict | None = None) -> dict:
+    """Deterministic attributional footprint.
+    Materials : m × (virgin·(1−r) + recycled·r)
+    Mfg / Use : kWh × grid factor
+    Transport : (Σmass/1000) t × km × mode factor
+    EoL       : m·recycle·(rec−virgin)·0.90  +  m·incin·f_incin  +  m·landfill·f_landfill
+    """
+    mods = mods or {}
+    lines = []
+    mass = 0.0
+    for row in p.get("bom", []):
+        mat = row.get("material")
+        if mat not in factors["materials"]:
+            raise ValueError(f"Unknown material '{mat}' in BOM — fix the line or extend the reference catalog.")
+        f = factors["materials"][mat]
+        m, r = _num(row.get("mass_kg")), _num(row.get("recycled_pct")) / 100.0
+        gf = f["ghg"] * (1 - r) + f["ghg_rec"] * r
+        mf = f["mj"] * (1 - r) + f["mj_rec"] * r
+        mass += m
+        lines.append(mk_line("Raw materials", row.get("component", "?"), m, "kg",
+                             f"MAT:{mat}", gf, m * gf, m * mf, row.get("quality", "proxy"),
+                             f"{m:g} kg × blended {gf:.3f} kgCO₂e/kg (recycled content {r:.0%})"))
+    mfg = p.get("manufacturing", {})
+    g = factors["grids"].get(mfg.get("grid"))
+    if g is None:
+        raise ValueError(f"Unknown manufacturing grid '{mfg.get('grid')}'.")
+    k = _num(mfg.get("kwh"))
+    lines.append(mk_line("Manufacturing", "Assembly & fabrication", k, "kWh",
+                         f"GRID:{mfg.get('grid')}", g["ghg"], k * g["ghg"], k * g["mj"],
+                         mfg.get("quality", "estimated"),
+                         f"{k:g} kWh × {g['ghg']:.3f} kgCO₂e/kWh ({mfg.get('grid')})"))
+    t = mass / 1000.0
+    for leg in p.get("transport", []):
+        tf = factors["transport"].get(leg.get("mode"))
+        if tf is None:
+            raise ValueError(f"Unknown transport mode '{leg.get('mode')}'.")
+        d = _num(leg.get("distance_km"))
+        tkm = t * d
+        lines.append(mk_line("Transport", leg["mode"], tkm, "t·km", f"TRN:{leg['mode']}",
+                             tf["ghg"], tkm * tf["ghg"], tkm * tf["mj"], "estimated",
+                             f"{t:.4f} t × {d:g} km × {tf['ghg']:.3f} kgCO₂e/t·km"))
+    use = p.get("use", {})
+    ug = factors["grids"].get(use.get("grid"))
+    if ug is None:
+        raise ValueError(f"Unknown use-phase grid '{use.get('grid')}'.")
+    lt = _num(p.get("lifetime_years"))
+    uk = _num(use.get("kwh_per_year")) * lt
+    um = _num(mods.get("use_grid_mult"), 1.0)
+    lines.append(mk_line("Use phase", f"{lt:g}-year operation", uk, "kWh",
+                         f"GRID:{use.get('grid')}", ug["ghg"] * um, uk * ug["ghg"] * um,
+                         uk * ug["mj"], use.get("quality", "estimated"),
+                         f"{_num(use.get('kwh_per_year')):g} kWh/y × {lt:g} y × {ug['ghg']:.3f} kgCO₂e/kWh"
+                         + (f" × grid multiplier {um:.2f}" if um != 1.0 else "")))
+    e = p.get("eol", {})
+    rr, ir, lr = _num(e.get("recycle_pct")) / 100, _num(e.get("incinerate_pct")) / 100, _num(e.get("landfill_pct")) / 100
+    for row in p.get("bom", []):
+        f = factors["materials"][row["material"]]
+        m = _num(row.get("mass_kg"))
+        credit = m * rr * (f["ghg_rec"] - f["ghg"]) * EOL_RECOVERY
+        incin = m * ir * f["incin"]
+        land = m * lr * f["landfill"]
+        mj_credit = m * rr * (f["mj_rec"] - f["mj"]) * EOL_RECOVERY
+        net = credit + incin + land
+        lines.append(mk_line("End of life", row.get("component", "?"), m, "kg",
+                             f"EOL:{row['material']}", net / m if m else 0.0, net, mj_credit,
+                             e.get("quality", "proxy"),
+                             f"credit {credit:.2f} + incineration {incin:.2f} + landfill {land:.2f} kgCO₂e "
+                             f"(shares {rr:.0%}/{ir:.0%}/{lr:.0%}, recovery {EOL_RECOVERY:.0%})"))
+    stages = {s: {"ghg": sum(l["ghg"] for l in lines if l["stage"] == s),
+                  "mj": sum(l["mj"] for l in lines if l["stage"] == s)} for s in STAGES}
+    total = sum(l["ghg"] for l in lines)
+    return {"lines": lines, "stages": stages, "total_ghg": total,
+            "total_mj": sum(l["mj"] for l in lines), "mass_kg": mass,
+            "per_year_ghg": total / lt if lt > 0 else float("nan")}
+
+def validate_product(p: dict) -> list:
+    issues = []
+    err = lambda f, m: issues.append({"severity": "error", "field": f, "message": m})
+    warn = lambda f, m: issues.append({"severity": "warning", "field": f, "message": m})
+    if not str(p.get("name", "")).strip(): err("name", "Product name is required")
+    lt = _num(p.get("lifetime_years"))
+    if not 0 < lt <= 100: err("lifetime_years", "Lifetime must be in (0, 100] years")
+    elif lt > 30: warn("lifetime_years", "Lifetime > 30 y — verify the assumption")
+    if not p.get("bom"): err("bom", "At least one BOM line is required")
+    comps = set()
+    for j, row in enumerate(p.get("bom", [])):
+        f = f"bom[{j}]"
+        m = _num(row.get("mass_kg"))
+        if m <= 0: err(f, f"'{row.get('component','?')}': mass_kg must be > 0")
+        elif m > 5000: warn(f, f"mass {m:g} kg — verify scale")
+        if row.get("material") not in MATERIAL_NAMES: err(f, f"unknown material '{row.get('material')}'")
+        if not 0 <= _num(row.get("recycled_pct"), -1) <= 100: err(f, "recycled_pct must be 0–100")
+        if row.get("quality") not in QUALITY_SIGMA: err(f, "quality must be measured / estimated / proxy")
+        c = str(row.get("component", "")).strip()
+        if not c: err(f, "component name required")
+        elif c in comps: warn(f, f"duplicate component name '{c}'")
+        comps.add(c)
+    for sect, key in [("manufacturing", "kwh"), ("use", "kwh_per_year")]:
+        s = p.get(sect, {})
+        if _num(s.get(key), -1) < 0: err(sect, "energy must be ≥ 0")
+        if s.get("grid") not in GRID_NAMES: err(sect, f"unknown grid '{s.get('grid')}'")
+    if not p.get("transport"): warn("transport", "No transport legs — assumes zero inbound logistics")
+    for j, leg in enumerate(p.get("transport", [])):
+        if leg.get("mode") not in TRANSPORT_NAMES: err(f"transport[{j}]", f"unknown mode '{leg.get('mode')}'")
+        d = _num(leg.get("distance_km"), -1)
+        if not 0 <= d <= 100000: err(f"transport[{j}]", "distance must be 0–100,000 km")
+        elif leg.get("mode") == "Air freight" and d > 8000: warn(f"transport[{j}]", "air leg > 8,000 km — confirm modal choice")
+    e = p.get("eol", {})
+    shares = [_num(e.get(k), -1) for k in ("recycle_pct", "incinerate_pct", "landfill_pct")]
+    if any(not 0 <= v <= 100 for v in shares): err("eol", "each end-of-life share must be 0–100%")
+    tot = sum(shares)
+    if abs(tot - 100) > 0.5: err("eol", f"End-of-life shares sum to {tot:g}% — must equal 100%")
+    if p.get("bom") and all(r.get("quality") == "proxy" for r in p["bom"]):
+        warn("quality", "All BOM lines use proxy data — expect wide uncertainty")
+    return issues
+
+def mc_draws(lines: list, n: int, seed: int) -> np.ndarray:
+    base = np.array([l["ghg"] for l in lines], dtype=float)
+    sig = np.array([l["sigma"] for l in lines], dtype=float)
+    if base.size == 0:
+        return np.zeros(n)
+    rng = np.random.default_rng(seed)
+    z = rng.standard_normal((n, base.size))
+    return (base * np.clip(1.0 + sig * z, 0.0, None)).sum(axis=1)
+
+@st.cache_data(show_spinner=False)
+def cached_mc(p_json: str, f_json: str, n: int, seed: int) -> dict:
+    r = compute_impacts(json.loads(p_json), json.loads(f_json))
+    t = mc_draws(r["lines"], n, seed)
+    return {"totals": t, "p5": float(np.percentile(t, 5)), "p50": float(np.percentile(t, 50)),
+            "p95": float(np.percentile(t, 95)), "mean": float(t.mean()), "std": float(t.std())}
+
+@st.cache_data(show_spinner=False)
+def cached_portfolio_mc(prods_json: str, f_json: str, n: int, seed: int) -> dict:
+    f = json.loads(f_json)
+    lines = []
+    for p in json.loads(prods_json):
+        try:
+            lines.extend(compute_impacts(p, f)["lines"])
+        except (ValueError, KeyError):
+            continue
+    t = mc_draws(lines, n, seed)
+    return {"totals": t, "p5": float(np.percentile(t, 5)), "p50": float(np.percentile(t, 50)),
+            "p95": float(np.percentile(t, 95)), "mean": float(t.mean()), "std": float(t.std())}
+
+def scenario_defaults(p: dict) -> dict:
+    return {"recycled_boost": 0, "use_eff": 0, "lifetime_mult": 1.0, "transport_cut": 0,
+            "sea_to_rail": False, "use_grid_mult": 1.0,
+            "mfg_grid": p["manufacturing"]["grid"],
+            "eol_target": int(round(_num(p["eol"]["recycle_pct"])))}
+
+def apply_scenario(p: dict, s: dict, factors: dict):
+    q = copy.deepcopy(p)
+    for row in q["bom"]:
+        row["recycled_pct"] = min(100.0, _num(row["recycled_pct"]) + s["recycled_boost"])
+    q["use"]["kwh_per_year"] = _num(q["use"]["kwh_per_year"]) * (1 - s["use_eff"] / 100.0)
+    q["lifetime_years"] = _num(q["lifetime_years"]) * s["lifetime_mult"]
+    q["transport"] = [{"mode": ("Rail" if s["sea_to_rail"] and l["mode"] == "Sea freight" else l["mode"]),
+                       "distance_km": _num(l["distance_km"]) * (1 - s["transport_cut"] / 100.0)}
+                      for l in q["transport"]]
+    q["manufacturing"]["grid"] = s["mfg_grid"]
+    t = float(s["eol_target"]); rest = 100.0 - t
+    oi, ol = _num(q["eol"]["incinerate_pct"]), _num(q["eol"]["landfill_pct"])
+    b = oi + ol
+    q["eol"] = {"recycle_pct": t,
+                "incinerate_pct": rest * oi / b if b > 0 else rest / 2,
+                "landfill_pct": rest * ol / b if b > 0 else rest / 2,
+                "quality": q["eol"].get("quality", "proxy")}
+    return q, compute_impacts(q, factors, mods={"use_grid_mult": s["use_grid_mult"]})
+
+# ══════════════════════════════ IMPORT PIPELINE (pure + testable) ══════════════════════════════
+IMPORT_COLS = ["product_id", "product_name", "category", "functional_unit", "lifetime_years",
+               "component", "material", "mass_kg", "recycled_pct", "data_quality",
+               "mfg_kwh", "mfg_grid", "use_kwh_per_year", "use_grid",
+               "transport_mode", "transport_km",
+               "eol_recycle_pct", "eol_incinerate_pct", "eol_landfill_pct"]
+NUM_COLS = ["lifetime_years", "mass_kg", "recycled_pct", "mfg_kwh", "use_kwh_per_year",
+            "transport_km", "eol_recycle_pct", "eol_incinerate_pct", "eol_landfill_pct"]
+STR_COLS = ["product_id", "product_name", "category", "functional_unit", "component",
+            "material", "data_quality", "mfg_grid", "use_grid", "transport_mode"]
+PROD_LEVEL = ["product_name", "category", "functional_unit", "lifetime_years", "mfg_kwh",
+              "mfg_grid", "use_kwh_per_year", "use_grid",
+              "eol_recycle_pct", "eol_incinerate_pct", "eol_landfill_pct"]
+
+def product_from_rows(rows: pd.DataFrame) -> dict:
+    r0 = rows.iloc[0]
+    bom = [{"component": r["component"], "material": r["material"], "mass_kg": float(r["mass_kg"]),
+            "recycled_pct": float(r["recycled_pct"]), "quality": r["data_quality"]}
+           for _, r in rows.iterrows()]
+    legs, seen = [], set()
+    for _, r in rows.iterrows():
+        key = (r["transport_mode"], float(r["transport_km"]))
+        if key not in seen:
+            seen.add(key); legs.append({"mode": key[0], "distance_km": key[1]})
+    now = utcnow()
+    return {"id": r0["product_id"], "name": r0["product_name"],
+            "category": r0["category"] or "General equipment",
+            "functional_unit": r0["functional_unit"] or f"1 unit · {float(r0['lifetime_years']):g} y service",
+            "status": "Draft", "schema_version": SCHEMA_VERSION,
+            "created_utc": now, "updated_utc": now, "lifetime_years": float(r0["lifetime_years"]),
+            "bom": bom,
+            "manufacturing": {"kwh": float(r0["mfg_kwh"]), "grid": r0["mfg_grid"], "quality": "estimated"},
+            "use": {"kwh_per_year": float(r0["use_kwh_per_year"]), "grid": r0["use_grid"], "quality": "estimated"},
+            "transport": legs,
+            "eol": {"recycle_pct": float(r0["eol_recycle_pct"]), "incinerate_pct": float(r0["eol_incinerate_pct"]),
+                    "landfill_pct": float(r0["eol_landfill_pct"]), "quality": "proxy"},
+            "override": None, "notes": "", "source": {"kind": "import"}}
+
+def parse_import(df: pd.DataFrame, existing_ids: set, factors: dict) -> dict:
+    res = {"missing_cols": [c for c in IMPORT_COLS if c not in df.columns], "row_errors": [],
+           "preview": None, "valid_products": [], "rejected_groups": {}, "n_rows": int(len(df))}
+    if res["missing_cols"]:
+        return res
+    d = df[IMPORT_COLS].copy().reset_index(drop=True)
+    for c in NUM_COLS:
+        d[c] = pd.to_numeric(d[c], errors="coerce")
+    for c in STR_COLS:
+        d[c] = d[c].where(d[c].notna(), "").astype(str).str.strip()
+    errs = [[] for _ in range(len(d))]
+    def bad(i, msg):
+        if msg not in errs[i]:
+            errs[i].append(msg)
+    for i in range(len(d)):
+        r = d.iloc[i]
+        for c in ["product_id", "product_name", "component", "material", "data_quality",
+                  "mfg_grid", "use_grid", "transport_mode"]:
+            if r[c] == "": bad(i, f"'{c}' is required")
+        for c in NUM_COLS:
+            if pd.isna(r[c]): bad(i, f"'{c}' must be a number")
+        if not pd.isna(r["mass_kg"]):
+            if r["mass_kg"] <= 0: bad(i, "mass_kg must be > 0")
+            elif r["mass_kg"] > 100000: bad(i, "mass_kg out of range (> 100,000)")
+        if not pd.isna(r["recycled_pct"]) and not 0 <= r["recycled_pct"] <= 100:
+            bad(i, "recycled_pct must be 0–100")
+        if not pd.isna(r["lifetime_years"]) and not 0 < r["lifetime_years"] <= 100:
+            bad(i, "lifetime_years must be in (0, 100]")
+        for c in ["mfg_kwh", "use_kwh_per_year", "transport_km"]:
+            if not pd.isna(r[c]) and r[c] < 0: bad(i, f"{c} must be ≥ 0")
+        if r["material"] and r["material"] not in factors["materials"]:
+            bad(i, f"unknown material '{r['material']}' — see Reference factors")
+        if r["transport_mode"] and r["transport_mode"] not in factors["transport"]:
+            bad(i, f"unknown transport mode '{r['transport_mode']}'")
+        for c in ["mfg_grid", "use_grid"]:
+            if r[c] and r[c] not in factors["grids"]: bad(i, f"unknown grid '{r[c]}'")
+        if r["data_quality"] and r["data_quality"] not in QUALITY_SIGMA:
+            bad(i, "data_quality must be measured / estimated / proxy")
+    seen = {}
+    for i in range(len(d)):
+        pid, comp = d.iloc[i]["product_id"], d.iloc[i]["component"]
+        if pid and comp:
+            key = (pid, comp)
+            if key in seen:
+                bad(i, f"duplicate key ({pid}, {comp}) — also file row {seen[key] + 2}")
+                bad(seen[key], f"duplicate key ({pid}, {comp}) — also file row {i + 2}")
             else:
-                txt = f"{v:,.2f}" if isinstance(v, float) else str(v)
-                cell = htmlmod.escape(txt)
-            cls = ' class="num"' if c in num_cols else ""
-            tds.append(f"<td{cls}>{cell}</td>")
-        trs.append("<tr>" + "".join(tds) + "</tr>")
-    return (f'<div class="tt-tablewrap" style="max-height:{max_h}px"><table class="tt">'
-            f'<thead><tr>{thead}</tr></thead><tbody>{"".join(trs)}</tbody></table></div>')
+                seen[key] = i
+    groups = {}
+    for i in range(len(d)):
+        groups.setdefault(d.iloc[i]["product_id"] or "(missing id)", []).append(i)
+    valid, rejected = [], {}
+    for pid, idxs in groups.items():
+        gmsgs = [m for i in idxs for m in errs[i]]
+        r0 = d.iloc[idxs[0]]
+        for c in PROD_LEVEL:
+            vals = {str(d.iloc[i][c]) for i in idxs}
+            if len(vals) > 1:
+                gmsgs.append(f"conflicting '{c}' across rows of {pid}: {sorted(vals)}")
+        if pid in existing_ids:
+            gmsgs.append(f"product_id '{pid}' already exists — use a new id (validated records are never overwritten)")
+        eol_vals = [r0[c] for c in ("eol_recycle_pct", "eol_incinerate_pct", "eol_landfill_pct")]
+        if not any(pd.isna(v) for v in eol_vals):
+            s = float(sum(eol_vals))
+            if abs(s - 100) > 0.5:
+                gmsgs.append(f"end-of-life shares sum to {s:g}% (must be 100%)")
+        if not gmsgs:
+            p = product_from_rows(d.iloc[idxs])
+            gmsgs = [x["message"] for x in validate_product(p) if x["severity"] == "error"]
+        if gmsgs:
+            rejected[pid] = sorted(set(gmsgs))
+            for i in idxs:
+                for m in gmsgs: bad(i, m)
+        else:
+            valid.append(product_from_rows(d.iloc[idxs]))
+    preview = d.copy()
+    preview.insert(0, "import_status", ["❌ rejected" if errs[i] else "✅ valid" for i in range(len(d))])
+    preview["errors"] = ["; ".join(e) for e in errs]
+    res.update(row_errors=errs, preview=preview, valid_products=valid, rejected_groups=rejected)
+    return res
 
-
-def kpi(label, value, sub, accent="lime"):
-    return (f'<div class="tt-kpi a-{accent}"><div class="l">{label}</div>'
-            f'<div class="v">{value}</div><div class="s">{sub}</div></div>')
-
-
-def sec(kicker, title, sub=None):
-    st.markdown(f'<div class="tt-kicker">{kicker}</div>', unsafe_allow_html=True)
-    st.markdown(f"## {title}")
-    if sub:
-        st.caption(sub)
-
-
-def flash(kind, msg):
-    st.session_state["flash"] = (kind, msg)
-
-
-def can(action):
-    return action in PERMS.get(st.session_state.get("role", "Stakeholder"), set())
-
-
-def grade(score):
-    return "A" if score >= .85 else "B" if score >= .70 else "C" if score >= .60 else "D"
-
-
-def strip(ctx):
-    t = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    share_href = htmlmod.escape(LINKEDIN_SHARE_URL, quote=True)
-    st.markdown(
-        f'<div class="tt-strip"><div><span class="dot"></span>'
-        f'<span class="chip hot">ENGINE v{ENGINE_VERSION}</span> '
-        f'<span class="chip">FACTORS {ctx["version"]}</span> '
-        f'<span class="chip">RUN {ctx["run_id"]}</span> '
-        f'<span class="chip">THEME {THEME_NAME}</span></div>'
-        f'<div><span class="chip">SYNTHETIC DEMO DATA</span> '
-        f'<span class="chip">{t}</span> '
-        f'<a class="tt-share" href="{share_href}" target="_blank" rel="noopener noreferrer">in Share on LinkedIn ↗</a>'
-        f'</div></div>', unsafe_allow_html=True)
-
-
-def linkedin_copy_component():
-    payload = json.dumps(LINKEDIN_POST)
-    html = """
-<div style="font-family:Inter,system-ui,sans-serif;">
-  <button id="tt-copy" style="background:#0A66C2;color:#fff;border:1.5px solid #0A66C2;border-radius:9px;
-  padding:9px 16px;font-weight:700;font-size:14px;cursor:pointer;box-shadow:2px 2px 0 rgba(10,102,194,.25);">
-  📋 Copy LinkedIn post</button>
-  <span id="tt-status" style="margin-left:10px;font-size:13px;color:#31473B;"></span>
-</div>
-<script>
-const ttText = __TT_PAYLOAD__;
-const btn = document.getElementById('tt-copy');
-const status = document.getElementById('tt-status');
-function ok(){ status.textContent = 'Copied ✓'; btn.textContent = '✓ Copied'; setTimeout(()=>{btn.textContent='📋 Copy LinkedIn post';status.textContent='';},2200); }
-function fail(){ status.textContent = 'Copy blocked — use the text box below.'; }
-btn.addEventListener('click', async () => {
-  try { await navigator.clipboard.writeText(ttText); ok(); }
-  catch(e) {
-    try {
-      const ta = document.createElement('textarea'); ta.value = ttText; ta.style.position='fixed'; ta.style.opacity='0';
-      document.body.appendChild(ta); ta.focus(); ta.select();
-      const done = document.execCommand('copy'); document.body.removeChild(ta);
-      done ? ok() : fail();
-    } catch(err) { fail(); }
-  }
-});
-</script>
+VALID_SAMPLE = """product_id,product_name,category,functional_unit,lifetime_years,component,material,mass_kg,recycled_pct,data_quality,mfg_kwh,mfg_grid,use_kwh_per_year,use_grid,transport_mode,transport_km,eol_recycle_pct,eol_incinerate_pct,eol_landfill_pct
+P-SOL-01,Solar Bollard Light,Municipal lighting,1 bollard · 10 y service,10,Housing,Aluminium,3.4,40,estimated,6.5,China,0,EU average,Sea freight,16000,65,20,15
+P-SOL-01,Solar Bollard Light,Municipal lighting,1 bollard · 10 y service,10,Battery pack,Li-ion battery,0.9,0,estimated,6.5,China,0,EU average,Sea freight,16000,65,20,15
+P-SOL-01,Solar Bollard Light,Municipal lighting,1 bollard · 10 y service,10,PV panel,PCB / electronics,0.6,0,proxy,6.5,China,0,EU average,Truck (HGV),300,65,20,15
+P-BIN-01,Smart Waste Bin,Municipal equipment,1 bin · 12 y service,12,Shell,Steel,18,60,measured,14,EU average,1.8,EU average,Rail,900,75,15,10
+P-BIN-01,Smart Waste Bin,Municipal equipment,1 bin · 12 y service,12,Lid,ABS plastic,2.6,25,estimated,14,EU average,1.8,EU average,Rail,900,75,15,10
+P-BIN-01,Smart Waste Bin,Municipal equipment,1 bin · 12 y service,12,Sensor unit,PCB / electronics,0.35,0,proxy,14,EU average,1.8,EU average,Truck (HGV),120,75,15,10
 """
-    components.html(html.replace("__TT_PAYLOAD__", payload), height=58)
 
+BROKEN_SAMPLE = """product_id,product_name,category,functional_unit,lifetime_years,component,material,mass_kg,recycled_pct,data_quality,mfg_kwh,mfg_grid,use_kwh_per_year,use_grid,transport_mode,transport_km,eol_recycle_pct,eol_incinerate_pct,eol_landfill_pct
+P-LED-001,Clone attempt,Municipal lighting,1 unit,15,Housing,Aluminium,6.2,30,estimated,18,China,378,EU average,Sea freight,18500,70,20,10
+P-BAD-01,Broken Widget,General equipment,1 unit,10,Frame,Unobtainium,5,0,estimated,5,Mars,10,EU average,Teleport,500,80,30,20
+P-BAD-01,Broken Widget,General equipment,1 unit,12,Frame,Steel,-2,0,estimated,5,Mars,10,EU average,Teleport,500,80,30,20
+P-BAD-01,Broken Widget,General equipment,1 unit,10,,Glass,1.2,0,estimated,5,Mars,10,EU average,Teleport,500,80,30,20
+P-BAD-01,Broken Widget,General equipment,1 unit,10,Panel,Glass,1.2,150,estimated,5,Mars,10,EU average,Teleport,500,80,30,20
+"""
 
-def linkedin_share_panel(ctx=None):
-    share_href = htmlmod.escape(LINKEDIN_SHARE_URL, quote=True)
-    st.markdown(
-        '<div class="tt-share-card"><h4>🔗 Share TerraTrace on LinkedIn</h4>'
-        '<p>Opens LinkedIn with a ready-made post. Copy the text first if you want to edit it before publishing.</p></div>',
-        unsafe_allow_html=True)
-    c1, c2 = st.columns([1, 1])
-    with c1:
-        st.link_button("in Share on LinkedIn ↗", LINKEDIN_SHARE_URL, **width_kwargs(st.link_button))
-    with c2:
-        linkedin_copy_component()
-    with st.expander("📝 Preview / edit the LinkedIn post text"):
-        edited = st.text_area("LinkedIn post", value=LINKEDIN_POST, height=260, key="li_post_text")
-        custom_url = "https://www.linkedin.com/feed/?shareActive=true&text=" + urllib.parse.quote(edited, safe="")
-        st.link_button("in Share this edited version ↗", custom_url, key="li_custom_share", **width_kwargs(st.link_button))
-        st.caption("LinkedIn opens in a new tab. If the composer does not pre-fill, paste the copied text.")
+# ══════════════════════════════ SYNTHETIC SEED DATA ══════════════════════════════
+def _mk(pid, name, category, fu, lifetime, bom, mfg, use, transport, eol, status, age, notes=""):
+    ts = days_ago(age)
+    return {"id": pid, "name": name, "category": category, "functional_unit": fu,
+            "status": status, "schema_version": SCHEMA_VERSION,
+            "created_utc": ts, "updated_utc": ts, "lifetime_years": float(lifetime),
+            "bom": [{"component": c, "material": m, "mass_kg": float(k), "recycled_pct": float(r), "quality": q}
+                    for c, m, k, r, q in bom],
+            "manufacturing": {"kwh": float(mfg[0]), "grid": mfg[1], "quality": "estimated"},
+            "use": {"kwh_per_year": float(use[0]), "grid": use[1], "quality": "estimated"},
+            "transport": [{"mode": m, "distance_km": float(d)} for m, d in transport],
+            "eol": {"recycle_pct": float(eol[0]), "incinerate_pct": float(eol[1]),
+                    "landfill_pct": float(eol[2]), "quality": "proxy"},
+            "override": None, "notes": notes, "source": {"kind": "demo", "file": "synthetic_seed", "batch_id": "B-DEMO"}}
 
+def demo_products() -> list:
+    return [
+        _mk("P-LED-001", "LED Streetlight SL-90", "Municipal lighting", "1 luminaire · 15 y service", 15,
+            [("Housing", "Aluminium", 6.2, 30, "estimated"), ("Bracket", "Steel", 3.1, 40, "measured"),
+             ("LED module", "LED module", 0.45, 0, "proxy"), ("Lens", "Glass", 0.8, 0, "estimated"),
+             ("Wiring", "Copper", 0.35, 20, "estimated"), ("Driver", "PCB / electronics", 0.22, 0, "proxy")],
+            (18, "China"), (378, "EU average"),
+            [("Sea freight", 18500), ("Truck (HGV)", 420)], (70, 20, 10), "Approved", 32,
+            "90 W · 4,200 h/y. Supplier declaration on file (synthetic)."),
+        _mk("P-EBK-002", "Municipal E-Bike Fleet Unit", "Mobility", "1 e-bike · 8 y service", 8,
+            [("Frame", "Aluminium", 9.0, 30, "estimated"), ("Battery", "Li-ion battery", 3.2, 0, "estimated"),
+             ("Fork", "Steel", 4.0, 50, "measured"), ("Tyres", "Rubber", 1.6, 10, "proxy"),
+             ("Motor windings", "Copper", 0.9, 15, "estimated"), ("Body panels", "ABS plastic", 1.2, 20, "estimated")],
+            (26, "China"), (72, "EU average"),
+            [("Sea freight", 15000), ("Truck (HGV)", 350)], (65, 20, 15), "In Review", 21,
+            "6,000 km/y fleet duty cycle · 12 Wh/km."),
+        _mk("P-WMT-003", "Smart Water Meter WM-2", "Water infrastructure", "1 meter · 12 y service", 12,
+            [("Body", "Brass", 0.4, 35, "measured"), ("Shell", "ABS plastic", 0.35, 25, "estimated"),
+             ("Electronics", "PCB / electronics", 0.12, 0, "proxy"), ("Battery", "Li-ion battery", 0.08, 0, "proxy"),
+             ("Window", "Glass", 0.05, 0, "estimated")],
+            (1.2, "EU average"), (0, "EU average"),
+            [("Truck (HGV)", 600)], (60, 25, 15), "Draft", 9,
+            "Battery-powered LoRa unit — materials-dominated footprint."),
+        _mk("P-CHR-004", "ErgoPro Task Chair", "Workplace furniture", "1 chair · 10 y service", 10,
+            [("Base", "Steel", 8.0, 40, "measured"), ("Gas column", "Aluminium", 3.0, 50, "estimated"),
+             ("Seat foam", "PUR foam", 2.2, 0, "proxy"), ("Fabric", "PET", 1.4, 60, "estimated"),
+             ("Castors", "ABS plastic", 0.9, 20, "estimated"), ("Packaging", "Cardboard", 1.1, 80, "measured")],
+            (12, "EU average"), (0, "EU average"),
+            [("Rail", 400), ("Truck (HGV)", 120)], (55, 30, 15), "Approved", 26,
+            "Regional manufacturing; take-back scheme pilot."),
+        _mk("P-HPT-005", "Rooftop Heat Pump HP-8", "HVAC equipment", "1 heat pump · 15 y service", 15,
+            [("Casing", "Steel", 42, 35, "measured"), ("Coil", "Copper", 6.5, 40, "estimated"),
+             ("Fins", "Aluminium", 4.2, 30, "estimated"), ("Compressor", "Steel", 12, 20, "estimated"),
+             ("Controls", "PCB / electronics", 1.1, 0, "proxy"), ("Fan", "ABS plastic", 1.8, 15, "estimated")],
+            (95, "EU average"), (2100, "EU average"),
+            [("Rail", 900), ("Truck (HGV)", 150)], (75, 15, 10), "In Review", 14,
+            "SCOP assumed 3.0 → 2,100 kWh electricity/y for 6.3 MWh heat."),
+        _mk("P-BEN-006", "CityLoop Recycled Bench", "Public realm", "1 bench · 20 y service", 20,
+            [("Slats", "Recycled plastic lumber", 24, 95, "measured"), ("Legs", "Steel", 9, 60, "measured"),
+             ("Fasteners", "Steel", 0.6, 60, "measured"), ("Plaque", "Aluminium", 0.2, 80, "proxy")],
+            (4, "EU average"), (0, "EU average"),
+            [("Truck (HGV)", 250)], (85, 10, 5), "Changes Requested", 18,
+            "Circular-economy showcase. EoL evidence pending."),
+    ]
 
-# ============================================================================
-# SESSION / SIDEBAR
-# ============================================================================
-def ensure_defaults(products):
-    ss = st.session_state
-    ss.setdefault("role", "Analyst")
-    ss.setdefault("actor_name", "Alex Rivera")
-    ss.setdefault("nav", "Overview")
-    ss.setdefault("bom_rev", 0)
-    ss.setdefault("leg_rev", 0)
-    ids = [p["id"] for p in products]
-    pending = ss.pop("pending_product", None)
-    if pending in ids:
-        ss["selected_product"] = pending
-    if ss.get("selected_product") not in ids:
-        ss["selected_product"] = ids[0]
-    for k, v in DEFAULT_PARAMS.items():
-        ss.setdefault("p_" + k, v)
+def build_demo_db() -> dict:
+    prods = demo_products()
+    audit = []
+    for p in prods:
+        audit.append(make_event("Ava Chen", "Analyst", "create", "product", p["id"],
+                                "Seeded synthetic demo record", ts=p["created_utc"]))
+    for pid, act, actor, role, age, det in [
+        ("P-LED-001", "validate", "Ava Chen", "Analyst", 30, "0 errors, 1 warning"),
+        ("P-LED-001", "submit", "Ava Chen", "Analyst", 29, "Submitted with supplier declaration"),
+        ("P-LED-001", "approve", "Dr. Ravi Patel", "Reviewer", 27, "Factors consistent with declaration (synthetic)"),
+        ("P-CHR-004", "approve", "Dr. Ravi Patel", "Reviewer", 24, "Take-back scheme documented"),
+        ("P-BEN-006", "request_changes", "Dr. Ravi Patel", "Reviewer", 16, "EoL recycling rate lacks a waste-manifest reference — attach evidence"),
+        ("P-HPT-005", "submit", "Ava Chen", "Analyst", 13, "SCOP assumption flagged for review"),
+        ("P-EBK-002", "submit", "Ava Chen", "Analyst", 12, "Fleet duty cycle from telematics sample"),
+    ]:
+        audit.append(make_event(actor, role, act, "product", pid, det, ts=days_ago(age)))
+    audit.sort(key=lambda a: a["ts"])
+    return {"schema_version": SCHEMA_VERSION,
+            "products": prods, "audit": audit, "scenarios": [],
+            "imports": [{"id": "B-DEMO", "file": "synthetic_seed (embedded)", "sha256": sha256_text("synthetic-seed"),
+                         "ts": days_ago(32), "actor": "System", "rows": sum(len(p["bom"]) for p in prods),
+                         "imported": len(prods), "rejected": 0, "format": "seed",
+                         "raw_text": "(embedded synthetic seed — labeled demo data)"}],
+            "factor_versions": {BASE_FACTOR_VERSION: base_factors()},
+            "factor_version": BASE_FACTOR_VERSION,
+            "saved_views": [{"name": "Approved records", "q": "", "status": ["Approved"], "cat": [], "sort": "Name A–Z"}],
+            "trash": [], "settings": {"mc_n": 4000, "mc_seed": 42}}
 
+def fixture_product() -> dict:
+    """Hand-checkable unit-test fixture (see self-checks)."""
+    now = utcnow()
+    return {"id": "T-001", "name": "Test widget", "category": "Test", "functional_unit": "1 unit · 10 y",
+            "status": "Draft", "schema_version": 1, "created_utc": now, "updated_utc": now,
+            "lifetime_years": 10.0,
+            "bom": [{"component": "Body", "material": "Steel", "mass_kg": 2.0, "recycled_pct": 0.0, "quality": "measured"}],
+            "manufacturing": {"kwh": 0.0, "grid": "EU average", "quality": "measured"},
+            "use": {"kwh_per_year": 100.0, "grid": "EU average", "quality": "measured"},
+            "transport": [{"mode": "Truck (HGV)", "distance_km": 100.0}],
+            "eol": {"recycle_pct": 80.0, "incinerate_pct": 10.0, "landfill_pct": 10.0, "quality": "measured"},
+            "override": None, "notes": "", "source": {"kind": "manual"}}
 
-def reset_params():
-    for k, v in DEFAULT_PARAMS.items():
-        st.session_state["p_" + k] = v
+# ══════════════════════════════ MUTATIONS (guarded, audited) ══════════════════════════════
+def transition(p: dict, to: str, note: str = ""):
+    guard(ACTION_PERM[to])
+    if to not in TRANSITIONS.get(p["status"], []):
+        raise ValueError(f"Illegal transition {p['status']} → {to}.")
+    if to in ("Validated", "Approved"):
+        errors = [i for i in validate_product(p) if i["severity"] == "error"]
+        if errors:
+            raise ValueError(f"Blocked: {len(errors)} validation error(s) — fix data before '{ACTION_VERB[to]}'.")
+    if to == "Changes Requested" and not note.strip():
+        raise ValueError("A reviewer note is required when requesting changes.")
+    frm = p["status"]
+    p["status"] = to
+    p["updated_utc"] = utcnow()
+    if to in ("Approved", "Changes Requested"):
+        p["review"] = {"by": current_user(), "role": st.session_state.role, "note": note, "ts": utcnow()}
+    log_event(ACTION_VERB[to], "product", p["id"], f"{frm} → {to}" + (f" · {note}" if note else ""))
 
+def record_locked(p: dict) -> bool:
+    return (not can("edit")) or p["status"] in ("Approved", "Archived")
 
-def randomize_params():
-    for k, (lo, hi, step) in PARAM_BOUNDS.items():
-        if k == "seed":
-            st.session_state["p_seed"] = random.randint(0, 999999)
-        elif float(step).is_integer():
-            st.session_state["p_" + k] = random.randrange(int(lo), int(hi) + 1, int(step))
-        else:
-            v = random.uniform(lo, hi)
-            st.session_state["p_" + k] = round(round(v / step) * step, 2)
+def update_product(p: dict, mutator, detail: str):
+    guard("edit")
+    if p["status"] in ("Approved", "Archived"):
+        raise PermissionError("Record is locked — an Administrator must reopen it first.")
+    mutator(p)
+    if p["status"] in ("Validated", "In Review", "Changes Requested"):
+        p["status"] = "Draft"
+        log_event("invalidate", "product", p["id"], "Edited after validation → returned to Draft")
+    p["updated_utc"] = utcnow()
+    log_event("update", "product", p["id"], detail)
 
+def delete_products(ids: list) -> str:
+    guard("delete")
+    db = st.session_state.db
+    removed, skipped = [], []
+    for pid in ids:
+        p = product_by_id(pid)
+        if p is None:
+            continue
+        if p["status"] == "Approved" and st.session_state.role != "Administrator":
+            skipped.append(pid); continue
+        idx = db["products"].index(p)
+        removed.append({"p": p, "idx": idx})
+    for item in sorted(removed, key=lambda x: -x["idx"]):
+        db["products"].pop(item["idx"])
+        log_event("delete", "product", item["p"]["id"], "Soft delete — undoable until next deletion")
+    if removed:
+        db["trash"] = removed  # previous trash purged (documented retention rule)
+    msg = f"Deleted {len(removed)} record(s) — Undo available."
+    if skipped:
+        msg += f" Skipped approved (admin only): {', '.join(skipped)}."
+    return msg
 
-def read_params():
-    return {k: st.session_state["p_" + k] for k in DEFAULT_PARAMS}
+def undo_delete():
+    db = st.session_state.db
+    for item in sorted(db["trash"], key=lambda x: x["idx"]):
+        db["products"].insert(min(item["idx"], len(db["products"])), item["p"])
+        log_event("restore_deleted", "product", item["p"]["id"], "Undo of soft delete")
+    n = len(db["trash"])
+    db["trash"] = []
+    return f"Restored {n} record(s)."
 
+def duplicate_product(p: dict) -> str:
+    guard("create")
+    q = copy.deepcopy(p)
+    q["id"] = f"P-{uid()[:6]}"
+    q["name"] = p["name"] + " (copy)"
+    q["status"] = "Draft"
+    q["override"] = None
+    q.pop("review", None)
+    q["created_utc"] = q["updated_utc"] = utcnow()
+    q["source"] = {"kind": "manual", "derived_from": p["id"]}
+    st.session_state.db["products"].append(q)
+    log_event("create", "product", q["id"], f"Duplicated from {p['id']}")
+    return q["id"]
 
-def build_sidebar(products, version):
-    ss = st.session_state
-    sb = st.sidebar
-    sb.markdown('<div class="tt-brand"><div class="tt-logo">🌿</div><div><b>TerraTrace</b>'
-                '<small>Lifecycle Impact Studio</small></div></div>', unsafe_allow_html=True)
-    sb.markdown('<div class="tt-side-h">Workspace</div>', unsafe_allow_html=True)
-    sb.radio("Navigation", ["Overview", "Products & BOM", "Import data", "Analysis",
-                            "Review & approvals", "Reports", "Governance"],
-             key="nav", label_visibility="collapsed")
-    c1, c2 = sb.columns(2)
-    c1.selectbox("Role (demo auth)", ROLES, key="role")
-    c2.text_input("Your name", key="actor_name")
-    names = {p["id"]: p["name"] for p in products}
-    sb.selectbox("Active product", list(names), key="selected_product",
-                 format_func=lambda i: names[i])
-    sb.markdown('<div class="tt-side-h">Scenario lab — applied live</div>', unsafe_allow_html=True)
-    sb.slider("Production volume ×", 0.2, 3.0, step=0.05, format="%.2f×", key="p_volume_mult",
-              help="Scales annual program volume for every product.")
-    sb.slider("Grid intensity (kg CO₂e/kWh)", 0.02, 0.90, step=0.01, format="%.2f", key="p_grid",
-              help="Electricity carbon intensity used in manufacturing and use phase.")
-    sb.slider("Use-phase energy ×", 0.2, 2.0, step=0.05, format="%.2f×", key="p_use_mult")
-    sb.slider("Service lifetime ×", 0.5, 2.0, step=0.05, format="%.2f×", key="p_life_mult")
-    sb.slider("Transport distance ×", 0.2, 3.0, step=0.05, format="%.2f×", key="p_dist_mult")
-    sb.slider("Air freight share (outbound)", 0, 30, step=1, format="%d%%", key="p_air_share")
-    sb.slider("Recycled content (metals/plastics)", 0, 100, step=5, format="%d%%", key="p_recycled_content")
-    sb.slider("EoL recycling rate", 0, 95, step=5, format="%d%%", key="p_eol_recycle")
-    sb.slider("Incineration of remainder", 0, 100, step=5, format="%d%%", key="p_incin_share")
-    sb.slider("Manufacturing scrap rate", 0, 20, step=1, format="%d%%", key="p_scrap")
-    sb.slider("Monte Carlo runs", 200, 5000, step=100, key="p_mc_runs")
-    sb.number_input("Random seed (reproducibility)", 0, 999999, step=1, key="p_seed")
-    b1, b2 = sb.columns(2)
-    b1.button("↺ Reset", on_click=reset_params, **width_kwargs(st.button))
-    b2.button("🎲 Randomize", on_click=randomize_params, **width_kwargs(st.button))
-    sb.markdown('<div class="tt-side-h">Save scenario</div>', unsafe_allow_html=True)
-    sb.text_input("Scenario name", key="scen_name", placeholder="e.g. Circular 2028",
-                  label_visibility="collapsed")
-    if sb.button("💾 Save current scenario", disabled=not can("scenario"),
-                 help="Analyst or Administrator role required", **width_kwargs(st.button)):
-        name = ss.get("scen_name", "").strip()
-        if not name:
-            sb.warning("Give the scenario a name first.")
-        else:
-            actor = f'{ss["actor_name"]} ({ss["role"]})'
-            with closing(db()) as c, c:
-                c.execute("INSERT INTO scenarios(name,params_json,created_at,actor,note) VALUES (?,?,?,?,?)",
-                          (name, json.dumps(read_params()), utcnow(), actor, "Saved from scenario lab"))
-                log_event(c, ss["actor_name"], ss["role"], "scenario_saved", "scenario", name, "Params snapshot")
-            flash("success", f"Scenario “{name}” saved — compare it on the Analysis page.")
-            st.rerun()
-    sb.markdown("---")
-    share_href = htmlmod.escape(LINKEDIN_SHARE_URL, quote=True)
-    sb.markdown(f'<a class="tt-share tt-share-side" href="{share_href}" target="_blank" rel="noopener noreferrer">'
-                f'in Share on LinkedIn ↗</a>', unsafe_allow_html=True)
-    sb.caption(f"Engine v{ENGINE_VERSION} · Factors {version} · SQLite local\n\n"
-               f"Theme: {THEME_NAME}. Demo roles are simulated; all data is synthetic.")
-    return ss["selected_product"], ss["role"], ss["actor_name"]
-
-
-# ============================================================================
-# PAGE — OVERVIEW
-# ============================================================================
-def page_overview(ctx):
-    strip(ctx)
-    prod, res, mc = ctx["prod"], ctx["res"], ctx["mc"]
-    base_total = ctx["baseline"][prod["id"]]["total"]
-    delta = (res["total"] - base_total) / base_total * 100 if base_total else 0.0
-    dcls = "delta-down" if delta <= 0 else "delta-up"
-    darrow = "▼" if delta <= 0 else "▲"
-    st.markdown(
-        f'<div class="tt-hero"><div class="tt-kicker">Product lifecycle impact · cradle-to-grave · GWP100</div>'
-        f'<h1>{htmlmod.escape(prod["name"])}</h1>'
-        f'<p>{htmlmod.escape(prod["description"])}</p>'
-        f'{badge(prod["status"])} &nbsp;<span class="chip">{htmlmod.escape(prod["category"])}</span> '
-        f'<span class="chip">{htmlmod.escape(prod["functional_unit"])}</span> '
-        f'<span class="chip">scenario vs baseline: <span class="{dcls}">{darrow} {abs(delta):.1f}%</span></span>'
-        f'</div>', unsafe_allow_html=True)
-
-    gross = {s: v for s, v in res["stages"].items() if s != "Credits" and v > 0}
-    dom = max(gross, key=gross.get) if gross else "—"
-    dom_share = gross[dom] / sum(gross.values()) * 100 if gross else 0
-    st.markdown('<div class="tt-kpi-grid">' + "".join([
-        kpi("Per-unit net footprint", f'{res["total"]:,.1f} <small style="font-size:.9rem">kg CO₂e</small>',
-            f'P5–P95: {mc["p5"]:,.1f} – {mc["p95"]:,.1f} · {mc["n"]:,} MC runs', "lime"),
-        kpi("Annual program", f'{res["annual"]/1000:,.1f} <small style="font-size:.9rem">t CO₂e</small>',
-            f'{res["volume"]:,.0f} units/yr under current scenario', "teal"),
-        kpi("Dominant stage", dom, f'{dom_share:.0f}% of gross impact — target here first', "amber"),
-        kpi("Data quality", f'{res["quality"]*100:.0f}<small style="font-size:.9rem">/100 · {grade(res["quality"])}</small>',
-            f'{res["proxy_share"]:.0%} proxy mass · gate {QUALITY_GATE*100:.0f}', "sky"),
-    ]) + "</div>", unsafe_allow_html=True)
-
-    c1, c2 = st.columns([3, 2])
-    with c1:
-        fig = go.Figure()
-        for s in STAGES:
-            fig.add_bar(x=[p["name"].split("—")[0].strip() for p in ctx["products"]],
-                        y=[ctx["results"][p["id"]]["stages"][s] for p in ctx["products"]],
-                        name=s, marker_color=STAGE_COLORS[s],
-                        hovertemplate="%{x}<br>" + s + ": %{y:.1f} kg CO₂e<extra></extra>")
-        fig.update_layout(barmode="relative")
-        show_fig(fig, 360, "Portfolio · per-unit footprint by stage (kg CO₂e)")
-    with c2:
-        if gross:
-            fig = go.Figure(go.Pie(labels=list(gross), values=list(gross.values()), hole=.62,
-                                   marker=dict(colors=[STAGE_COLORS[s] for s in gross],
-                                               line=dict(color="#F7F2E7", width=2)),
-                                   textinfo="label+percent", textfont=dict(size=11, color="#FFFDF8"),
-                                   hovertemplate="%{label}: %{value:.1f} kg CO₂e<extra></extra>"))
-            fig.update_layout(annotations=[dict(text=f'<b>{res["total"]:,.0f}</b><br>kg net',
-                                                showarrow=False, font=dict(size=17, color="#16281F"))])
-            show_fig(fig, 360, "Selected product · gross stage mix", legend=False)
-            st.caption(f'Credits from recycling: {res["stages"]["Credits"]:,.1f} kg CO₂e (already netted above).')
-        else:
-            st.info("No positive contributions yet — add BOM lines on Products & BOM.")
-
-    pos = res["rows"][res["rows"]["gwp"] > 0]
-    if not pos.empty:
-        ids, labels, parents, values, colors = [], [], [], [], []
-        for s in STAGES:
-            sub = pos[pos["stage"] == s]
-            if sub.empty:
-                continue
-            ids.append(s); labels.append(s); parents.append(""); values.append(float(sub["gwp"].sum()))
-            colors.append(STAGE_COLORS[s])
-            for i, r in sub.iterrows():
-                ids.append(f"{s}/{i}"); labels.append(r["item"]); parents.append(s)
-                values.append(float(r["gwp"])); colors.append(STAGE_COLORS[s])
-        fig = go.Figure(go.Treemap(ids=ids, labels=labels, parents=parents, values=values,
-                                   branchvalues="total", marker=dict(colors=colors, line=dict(width=2, color="#F7F2E7")),
-                                   texttemplate="%{label}<br>%{value:.1f}", textfont=dict(size=12, color="#FFFDF8"),
-                                   hovertemplate="%{label}<br>%{value:.2f} kg CO₂e<extra></extra>"))
-        show_fig(fig, 400, "Hotspot map · contribution treemap (positive burdens, kg CO₂e)", legend=False)
-
-    c3, c4 = st.columns([3, 2])
-    with c3:
-        if not pos.empty:
-            top = pos.sort_values("gwp", ascending=False).head(10).copy()
-            cum = top["gwp"].cumsum() / pos["gwp"].sum() * 100
-            fig = go.Figure()
-            fig.add_bar(x=top["item"], y=top["gwp"],
-                        marker_color=[STAGE_COLORS[s] for s in top["stage"]], name="Contribution")
-            fig.add_scatter(x=top["item"], y=cum, yaxis="y2", mode="lines+markers",
-                            line=dict(color="#DB2777", width=2.5), name="Cumulative %")
-            fig.update_layout(yaxis2=dict(overlaying="y", side="right", range=[0, 105],
-                                          showgrid=False, ticksuffix="%", tickfont=dict(color="#DB2777")),
-                              xaxis=dict(tickangle=-28, tickfont=dict(size=10)))
-            show_fig(fig, 380, "Pareto · top contributors")
-    with c4:
-        st.markdown("#### Recent activity")
-        aud = qdf("SELECT * FROM audit_events ORDER BY id DESC LIMIT 7")
-        icons = {"created": "✚", "bom_updated": "✎", "import": "⇪", "approved": "✔",
-                 "in_review": "➤", "override_added": "⚠", "export": "⤓", "factors_changed": "⟳"}
-        items = []
-        for _, r in aud.iterrows():
-            ic = icons.get(r["event"], "•")
-            items.append(f'<li>{ic} <b>{htmlmod.escape(r["event"])}</b> · {htmlmod.escape(r["entity_id"] or "")}'
-                         f'<small>{htmlmod.escape(r["actor"])} ({htmlmod.escape(r["role"])}) · {r["ts"][:16]}'
-                         f' · {htmlmod.escape(r["details"] or "")}</small></li>')
-        st.markdown('<ul class="tt-feed">' + "".join(items) + "</ul>", unsafe_allow_html=True)
-        with st.expander("Data quality flags"):
-            for lvl, msg in res["flags"]:
-                st.markdown(f'<span class="b b-{lvl}">{lvl}</span> {htmlmod.escape(msg)}', unsafe_allow_html=True)
-    linkedin_share_panel(ctx)
-    st.caption(f'Run {ctx["run_id"]} · engine v{ENGINE_VERSION} · factors {ctx["version"]} · '
-               "Monte Carlo is seeded and reproducible. Synthetic demo data — decision support only.")
-
-
-# ============================================================================
-# PAGE — PRODUCTS & BOM
-# ============================================================================
-def page_products(ctx):
-    strip(ctx)
-    sec("Registry", "Products & bill of materials",
-        "Create, edit and validate product records. Edits are audited; imported source files are preserved.")
-    prods = ctx["products"]
-
-    f1, f2, f3 = st.columns([2, 2, 1])
-    search = f1.text_input("Search registry", key="reg_search", placeholder="Name or category…").strip().lower()
-    stat = f2.multiselect("Filter status", list(STATUS_LABEL), format_func=lambda s: STATUS_LABEL[s], key="reg_status")
-    sort_by = f3.selectbox("Sort by", ["Updated", "Name", "Footprint ↑", "Footprint ↓"], key="reg_sort")
-    view = [p for p in prods if (not search or search in p["name"].lower() or search in p["category"].lower())
-            and (not stat or p["status"] in stat)]
-    if sort_by == "Name":
-        view = sorted(view, key=lambda p: p["name"].lower())
-    elif sort_by == "Footprint ↑":
-        view = sorted(view, key=lambda p: ctx["results"][p["id"]]["total"])
-    elif sort_by == "Footprint ↓":
-        view = sorted(view, key=lambda p: ctx["results"][p["id"]]["total"], reverse=True)
-    else:
-        view = sorted(view, key=lambda p: p["updated_at"], reverse=True)
-    reg = pd.DataFrame([{
-        "Product": p["name"], "Category": p["category"], "Status": p["status"],
-        "Per-unit kg CO₂e": round(ctx["results"][p["id"]]["total"], 1),
-        "Annual t CO₂e": round(ctx["results"][p["id"]]["annual"] / 1000, 1),
-        "Quality": f'{ctx["results"][p["id"]]["quality"]*100:.0f}',
-        "Updated": p["updated_at"][:16],
-    } for p in view], columns=["Product", "Category", "Status", "Per-unit kg CO₂e", "Annual t CO₂e", "Quality", "Updated"])
-    st.caption(f"{len(view)} of {len(prods)} products shown · search, filter and sort are live (table only).")
-    st.markdown(html_table(reg, badge_col="Status", num_cols=("Per-unit kg CO₂e", "Annual t CO₂e")), unsafe_allow_html=True)
-    if not view:
-        st.info("No products match the current filters.")
-
-    with st.expander("➕ New product (Analyst / Administrator)"):
-        with st.form("new_product"):
-            n1, n2 = st.columns(2)
-            name = n1.text_input("Name*", placeholder="SolarSense P1 — PV Microinverter")
-            cat = n2.text_input("Category", value="Municipal IoT")
-            desc = st.text_area("Description", value="Synthetic demo record — describe the product and its context.")
-            fu = st.text_input("Functional unit", value="1 unit · 10-year service life")
-            f1, f2, f3, f4, f5 = st.columns(5)
-            life = f1.number_input("Lifetime (yr)", 0.5, 50.0, 10.0)
-            use = f2.number_input("Use energy (kWh/yr)", 0.0, 100000.0, 5.0)
-            asm = f3.number_input("Assembly (kWh/unit)", 0.0, 10000.0, 2.0)
-            gas = f4.number_input("Process heat (kWh/unit)", 0.0, 10000.0, 0.5)
-            vol = f5.number_input("Annual volume", 1, 10_000_000, 1000)
-            ok = st.form_submit_button("Create draft", disabled=not can("edit"), type="primary")
-        if ok:
-            if not name.strip():
-                st.error("Name is required.")
-            else:
-                pid = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")[:24] + "-" + uuid.uuid4().hex[:4]
-                with closing(db()) as c, c:
-                    c.execute("INSERT INTO products VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                              (pid, name.strip(), cat, desc, fu, "draft", life, use, asm, gas, vol,
-                               utcnow(), utcnow(), ctx["actor"], "manual://entry", SCHEMA_VERSION))
-                    for scope, mode, km in [("inbound", "sea", 8000), ("inbound", "truck", 400), ("outbound", "truck", 600)]:
-                        c.execute("INSERT INTO transport_legs(product_id,scope,mode,km,created_at) VALUES (?,?,?,?,?)",
-                                  (pid, scope, mode, km, utcnow()))
-                    log_event(c, ctx["actor"], ctx["role"], "created", "product", pid, "Manual entry")
-                st.session_state["pending_product"] = pid
-                flash("success", f"Draft “{name}” created — add BOM lines below.")
-                st.rerun()
-
-    prod = ctx["prod"]
-    locked = prod["status"] not in EDITABLE or not can("edit")
-    st.markdown(f'### {htmlmod.escape(prod["name"])} &nbsp; {badge(prod["status"])}', unsafe_allow_html=True)
-    if locked:
-        lock_reason = " / read-only role" if not can("edit") else ""
-        st.markdown(
-            '<div class="tt-note">🔒 Record is locked ('
-            + STATUS_LABEL[prod["status"]] + lock_reason
-            + '). Reopen it on Review & approvals to edit.</div>',
-            unsafe_allow_html=True)
-
-    with st.expander("Product metadata & energy assumptions", expanded=False):
-        with st.form("meta_form"):
-            m1, m2 = st.columns(2)
-            name = m1.text_input("Name", value=prod["name"], disabled=locked)
-            cat = m2.text_input("Category", value=prod["category"], disabled=locked)
-            desc = st.text_area("Description", value=prod["description"], disabled=locked)
-            fu = st.text_input("Functional unit", value=prod["functional_unit"], disabled=locked)
-            f1, f2, f3, f4, f5 = st.columns(5)
-            life = f1.number_input("Lifetime (yr)", 0.5, 50.0, float(prod["lifetime_yr"]), disabled=locked)
-            use = f2.number_input("Use energy (kWh/yr)", 0.0, 100000.0, float(prod["use_kwh_yr"]), disabled=locked)
-            asm = f3.number_input("Assembly (kWh/unit)", 0.0, 10000.0, float(prod["assembly_kwh"]), disabled=locked)
-            gas = f4.number_input("Process heat (kWh/unit)", 0.0, 10000.0, float(prod["gas_kwh"]), disabled=locked)
-            vol = f5.number_input("Annual volume", 1, 10_000_000, int(prod["base_volume"]), disabled=locked)
-            saved = st.form_submit_button("Save metadata", disabled=locked, type="primary")
-        if saved:
-            with closing(db()) as c, c:
-                new_status = "draft" if prod["status"] in ("validated", "changes_requested") else prod["status"]
-                c.execute("UPDATE products SET name=?,category=?,description=?,functional_unit=?,lifetime_yr=?,"
-                          "use_kwh_yr=?,assembly_kwh=?,gas_kwh=?,base_volume=?,status=?,updated_at=? WHERE id=?",
-                          (name, cat, desc, fu, life, use, asm, gas, vol, new_status, utcnow(), prod["id"]))
-                log_event(c, ctx["actor"], ctx["role"], "metadata_updated", "product", prod["id"], "Metadata edited")
-            flash("success", "Metadata saved and audited.")
-            st.rerun()
-
-    st.markdown("#### Bill of materials")
-    mat_codes = list(ctx["factors"]["materials"])
-    bom_df = pd.DataFrame(ctx["lines"])[["material_code", "mass_kg", "supplier", "quality"]] \
-        if ctx["lines"] else pd.DataFrame(columns=["material_code", "mass_kg", "supplier", "quality"])
-    edited = st.data_editor(
-        bom_df, num_rows="dynamic", disabled=locked, hide_index=True,
-        key=f'bom_{prod["id"]}_{st.session_state["bom_rev"]}',
-        column_config={
-            "material_code": st.column_config.SelectboxColumn("Material", options=mat_codes, required=True),
-            "mass_kg": st.column_config.NumberColumn("Mass (kg)", min_value=0.0, max_value=5000.0, step=0.01, format="%.3f"),
-            "supplier": st.column_config.TextColumn("Supplier"),
-            "quality": st.column_config.SelectboxColumn("Data quality", options=list(QW), required=True),
-        }, **width_kwargs(st.data_editor))
-    clean = edited.dropna(subset=["material_code", "mass_kg"])
-    clean = clean[clean["material_code"].astype(str).str.len() > 0]
-    if not clean.empty:
-        try:
-            preview = assess(prod, clean.to_dict("records"), ctx["legs"], ctx["params"], ctx["factors"], ctx["overrides"])
-            st.caption(f'Live preview from editor: **{preview["mass"]:.2f} kg** BOM mass · '
-                       f'**{preview["total"]:,.1f} kg CO₂e** per unit (unsaved).')
-        except ValueError as e:
-            st.warning(f"Preview unavailable: {e}")
-    if st.button("💾 Save BOM", disabled=locked, type="primary", key="save_bom"):
-        rows, errs = [], []
-        seen = set()
-        for _, r in clean.iterrows():
-            code = str(r["material_code"]).strip().lower()
-            q = str(r.get("quality") or "proxy")
-            try:
-                mass = float(r["mass_kg"])
-            except (TypeError, ValueError):
-                errs.append(f"{code}: mass is not numeric"); continue
-            if code not in mat_codes:
-                errs.append(f"{code}: unknown material")
-            if code in seen:
-                errs.append(f"{code}: duplicate line")
-            if not (0 < mass <= 5000):
-                errs.append(f"{code}: mass out of range (0–5000]")
-            if q not in QW:
-                errs.append(f"{code}: quality must be measured/supplier/proxy")
-            seen.add(code)
-            rows.append({"material_code": code, "mass_kg": mass, "supplier": str(r.get("supplier") or ""), "quality": q})
-        if errs:
-            st.error("BOM not saved:\n- " + "\n- ".join(errs))
-        elif not rows:
-            st.error("BOM cannot be empty.")
-        else:
-            try:
-                replace_bom(prod["id"], rows, ctx["actor"], ctx["role"], "manual://editor")
-                st.session_state["bom_rev"] += 1
-                flash("success", f"BOM saved — {len(rows)} lines, audited.")
-                st.rerun()
-            except (PermissionError, ValueError) as e:
-                st.error(str(e))
-
-    st.markdown("#### Transport legs")
-    leg_df = pd.DataFrame(ctx["legs"])[["scope", "mode", "km"]] \
-        if ctx["legs"] else pd.DataFrame(columns=["scope", "mode", "km"])
-    ledit = st.data_editor(
-        leg_df, num_rows="dynamic", disabled=locked, hide_index=True,
-        key=f'legs_{prod["id"]}_{st.session_state["leg_rev"]}',
-        column_config={
-            "scope": st.column_config.SelectboxColumn("Scope", options=["inbound", "outbound"], required=True),
-            "mode": st.column_config.SelectboxColumn("Mode", options=["truck", "rail", "sea", "air"], required=True),
-            "km": st.column_config.NumberColumn("Distance (km)", min_value=0.0, max_value=40000.0, step=50.0, format="%.0f"),
-        }, **width_kwargs(st.data_editor))
-    if st.button("💾 Save transport", disabled=locked, key="save_legs"):
-        lrows = ledit.dropna(subset=["scope", "mode", "km"]).to_dict("records")
-        try:
-            replace_legs(prod["id"], lrows, ctx["actor"], ctx["role"])
-            st.session_state["leg_rev"] += 1
-            flash("success", f"Transport saved — {len(lrows)} legs.")
-            st.rerun()
-        except (PermissionError, ValueError) as e:
-            st.error(str(e))
-
-    with st.expander("⚠ Danger zone — delete product (Administrator)"):
-        confirm = st.checkbox("I understand this deletes the BOM, legs and overrides (audit history is kept).")
-        last = len(prods) == 1
-        if st.button("🗑 Delete product", disabled=not can("delete") or not confirm or last,
-                     help="Requires Administrator + confirmation; the last demo product cannot be deleted."):
-            with closing(db()) as c, c:
-                c.execute("DELETE FROM overrides WHERE product_id=?", (prod["id"],))
-                c.execute("DELETE FROM products WHERE id=?", (prod["id"],))
-                log_event(c, ctx["actor"], ctx["role"], "deleted", "product", prod["id"], prod["name"])
-            flash("warning", f'Product “{prod["name"]}” deleted. Audit history retained.')
-            st.rerun()
-
-
-# ============================================================================
-# PAGE — IMPORT
-# ============================================================================
-def page_import(ctx):
-    strip(ctx)
-    sec("Ingestion", "Import BOM data — CSV / Excel",
-        "Preview before commit · row-level validation · downloadable error report · original files preserved with checksums.")
-    prod = ctx["prod"]
-    c1, c2 = st.columns([2, 1])
-    with c1:
-        up = st.file_uploader("Upload CSV or XLSX", type=["csv", "xlsx"], key="imp_file")
-    with c2:
-        st.download_button("⬇ Download CSV template", TEMPLATE_CSV, "terratrace_bom_template.csv",
-                           "text/csv", **width_kwargs(st.download_button))
-        demo = st.toggle("Use malformed demo file (shows rejection)", key="imp_demo")
-    mode = st.radio("Import mode", ["Append", "Replace"], horizontal=True, key="imp_mode",
-                    help="Append rejects materials already in the BOM. Replace overwrites the BOM (audited).")
-    confirm_replace = True
-    if mode == "Replace":
-        confirm_replace = st.checkbox("Confirm: replace the existing BOM (original import files stay preserved).", key="imp_confirm")
-
-    raw, fname = None, None
-    if demo:
-        raw, fname = BAD_CSV.encode("utf-8"), "malformed_demo.csv"
-        st.info("Using the built-in malformed sample — 8 rows, several deliberate defects.")
-    elif up is not None:
-        raw, fname = up.getvalue(), up.name
-    if raw is None:
-        st.markdown('<div class="tt-note">Upload a file or flip the malformed-demo toggle. Required columns: '
-                    '<b>material_code, mass_kg, supplier, quality</b>. Allowed materials are listed in Governance → Factor catalog.</div>',
-                    unsafe_allow_html=True)
-    else:
-        if len(raw) > MAX_UPLOAD_BYTES:
-            st.error("File exceeds the 5 MB upload limit.")
-            st.stop()
-        try:
-            df = pd.read_csv(io.BytesIO(raw)) if fname.lower().endswith(".csv") else pd.read_excel(io.BytesIO(raw))
-        except Exception as e:
-            st.error(f"Could not parse file: {e}")
-            st.stop()
-        if df.empty:
-            st.error("File contains no data rows.")
-            st.stop()
-        missing = [c for c in IMPORT_COLS if c not in df.columns]
-        if missing:
-            st.error(f"Missing required columns: {missing}. Download the template for the expected schema.")
-            st.stop()
-        extra = [c for c in df.columns if c not in IMPORT_COLS]
-        if extra:
-            st.warning(f"Ignoring extra columns: {extra}")
-        df = df[IMPORT_COLS]
-        existing = {str(l["material_code"]).lower() for l in ctx["lines"]}
-        out = validate_import(df, existing, mode, ctx["factors"])
-        n_ok = int((out["_status"] == "valid").sum())
-        n_err = int((out["_status"] == "error").sum())
-        k1, k2, k3 = st.columns(3)
-        k1.markdown(kpi("Rows", str(len(out)), "parsed from source", "sky"), unsafe_allow_html=True)
-        k2.markdown(kpi("Valid", str(n_ok), "ready to commit", "lime"), unsafe_allow_html=True)
-        k3.markdown(kpi("Rejected", str(n_err), "actionable errors below", "amber"), unsafe_allow_html=True)
-        prev = out.copy()
-        prev["status"] = prev["_status"].map({"valid": "ok", "error": "error"})
-        st.markdown(html_table(prev[IMPORT_COLS + ["status", "_errors"]].rename(columns={"_errors": "errors"}),
-                               badge_col="status", max_h=320), unsafe_allow_html=True)
-        if n_err:
-            err_csv = out[out["_status"] == "error"].to_csv(index=False)
-            st.download_button("⬇ Download error report (CSV)", err_csv,
-                               f"errors_{Path(fname).stem}.csv", "text/csv", key="imp_err")
-        disabled = (n_ok == 0) or (not can("import")) or (mode == "Replace" and not confirm_replace)
-        if st.button(f"✅ Commit {n_ok} valid rows → {prod['name']}", disabled=disabled, type="primary", key="imp_commit",
-                     help="Analyst / Administrator role required; record must be editable."):
-            if prod["status"] not in EDITABLE:
-                st.error("Target record is locked — reopen it before importing.")
-                st.stop()
-            sha = hashlib.sha256(raw).hexdigest()
-            safe = re.sub(r"[^A-Za-z0-9._-]", "_", Path(fname).name)
-            (UPLOAD_DIR / f"{sha[:16]}_{safe}").write_bytes(raw)
-            good = out[out["_status"] == "valid"]
-            rows = [{"material_code": str(r["material_code"]).strip().lower(), "mass_kg": float(r["mass_kg"]),
-                     "supplier": str(r.get("supplier") or ""), "quality": str(r["quality"]).strip().lower()}
-                    for _, r in good.iterrows()]
-            try:
-                if mode == "Replace":
-                    replace_bom(prod["id"], rows, ctx["actor"], ctx["role"], f"import://{safe}")
-                else:
-                    merged = [{"material_code": l["material_code"], "mass_kg": l["mass_kg"],
-                               "supplier": l["supplier"], "quality": l["quality"]} for l in ctx["lines"]] + rows
-                    replace_bom(prod["id"], merged, ctx["actor"], ctx["role"], f"import://{safe}")
-                with closing(db()) as c, c:
-                    c.execute("INSERT INTO imports(ts,product_id,filename,sha256,mode,rows_total,rows_ok,rows_err,actor) VALUES (?,?,?,?,?,?,?,?,?)",
-                              (utcnow(), prod["id"], safe, sha, mode, len(out), n_ok, n_err, ctx["actor"]))
-                    log_event(c, ctx["actor"], ctx["role"], "import", "product", prod["id"],
-                              f"{safe} · {n_ok}/{len(out)} rows · sha256={sha[:12]}…")
-                st.session_state["bom_rev"] += 1
-                flash("success", f"Imported {n_ok} rows ({n_err} rejected). Source preserved as {sha[:16]}_{safe}.")
-                st.rerun()
-            except (PermissionError, ValueError) as e:
-                st.error(str(e))
-    st.markdown("#### Import history (lineage)")
-    hist = qdf("SELECT ts, product_id, filename, mode, rows_total, rows_ok, rows_err, actor, sha256 FROM imports ORDER BY id DESC LIMIT 20")
-    if hist.empty:
-        st.caption("No imports yet — history will appear here with checksums for full lineage.")
-    else:
-        hist["sha256"] = hist["sha256"].str[:16] + "…"
-        st.markdown(html_table(hist, num_cols=("rows_total", "rows_ok", "rows_err")), unsafe_allow_html=True)
-
-
-# ============================================================================
-# PAGE — ANALYSIS
-# ============================================================================
-def page_analysis(ctx):
-    strip(ctx)
-    prod, res, mc = ctx["prod"], ctx["res"], ctx["mc"]
-    sec("Analytics", f'Impact analysis — {prod["name"]}',
-        "Deterministic accounting first; uncertainty and sensitivity are layered on top, never hidden.")
-
-    st.markdown("### Uncertainty · Monte Carlo")
-    u1, u2, u3, u4 = st.columns(4)
-    u1.markdown(kpi("P5", f'{mc["p5"]:,.1f}', "kg CO₂e / unit", "sky"), unsafe_allow_html=True)
-    u2.markdown(kpi("P50 (median)", f'{mc["p50"]:,.1f}', "kg CO₂e / unit", "lime"), unsafe_allow_html=True)
-    u3.markdown(kpi("P95", f'{mc["p95"]:,.1f}', "kg CO₂e / unit", "amber"), unsafe_allow_html=True)
-    u4.markdown(kpi("Spread", f'±{mc["std"]:,.1f}', f'std dev · {mc["n"]:,} draws · seed {ctx["params"]["seed"]}', "teal"), unsafe_allow_html=True)
-    fig = go.Figure(go.Histogram(x=mc["samples"], nbinsx=45, marker_color="#65A30D",
-                                 marker_line=dict(width=0), opacity=.88,
-                                 hovertemplate="%{x:.1f} kg CO₂e<br>%{y} runs<extra></extra>"))
-    for val, lab, col, dash in [(mc["p5"], "P5", "#2563EB", "dash"), (mc["p50"], "P50", "#16281F", "solid"),
-                                (mc["p95"], "P95", "#D97706", "dash")]:
-        fig.add_vline(x=val, line_width=1.8, line_dash=dash, line_color=col,
-                      annotation_text=lab, annotation_font_color=col)
-    show_fig(fig, 330, "Distribution of per-unit footprint (kg CO₂e)", legend=False)
-    st.caption("Lognormal factor sampling; catalog uncertainty treated as a 95% half-width. "
-               "Same seed ⇒ identical result. Correlations between factors are not modeled (MVP limitation).")
-
-    st.markdown("### Sensitivity · one-at-a-time tornado")
-    tdf, base = tornado(prod, ctx["lines"], ctx["legs"], ctx["params"], ctx["factors"], ctx["overrides"])
-    tdf = tdf.sort_values("span")
-    fig = go.Figure()
-    fig.add_bar(y=tdf["driver"], x=tdf["low"], orientation="h", name="−20% / −15pp", marker_color="#2563EB")
-    fig.add_bar(y=tdf["driver"], x=tdf["high"], orientation="h", name="+20% / +15pp", marker_color="#D97706")
-    fig.update_layout(barmode="relative")
-    show_fig(fig, 360, "Change in per-unit footprint vs current scenario (kg CO₂e)")
-    top_driver = tdf.iloc[-1]["driver"]
-    st.caption(f"Largest lever right now: **{top_driver}**. Deterministic base = {base:,.1f} kg CO₂e.")
-
-    st.markdown("### Scenario comparison")
-    scens = qdf("SELECT * FROM scenarios ORDER BY id")
-    names, totals, colors = ["Baseline", "Current"], [ctx["baseline"][prod["id"]]["total"], res["total"]], ["#8A9A8E", "#65A30D"]
-    rows = [{"Scenario": "Baseline", "Per-unit kg CO₂e": round(totals[0], 1), "Δ vs baseline": "—", "Actor": "engine defaults"},
-            {"Scenario": "Current", "Per-unit kg CO₂e": round(totals[1], 1),
-             "Δ vs baseline": f'{(totals[1]-totals[0])/totals[0]*100:+.1f}%' if totals[0] else "—", "Actor": "scenario lab"}]
-    palette = ["#0D9488", "#2563EB", "#D97706", "#7C3AED", "#DB2777"]
-    for i, (_, s) in enumerate(scens.iterrows()):
-        p = json.loads(s["params_json"])
-        t = assess(prod, ctx["lines"], ctx["legs"], p, ctx["factors"], ctx["overrides"])["total"]
-        names.append(s["name"]); totals.append(t); colors.append(palette[i % len(palette)])
-        rows.append({"Scenario": s["name"], "Per-unit kg CO₂e": round(t, 1),
-                     "Δ vs baseline": f'{(t-totals[0])/totals[0]*100:+.1f}%' if totals[0] else "—",
-                     "Actor": s["actor"]})
-    fig = go.Figure(go.Bar(x=names, y=totals, marker_color=colors,
-                           text=[f"{t:,.0f}" for t in totals], textposition="outside",
-                           hovertemplate="%{x}: %{y:.1f} kg CO₂e<extra></extra>"))
-    show_fig(fig, 330, "Saved scenarios · per-unit footprint (kg CO₂e)", legend=False)
-    st.markdown(html_table(pd.DataFrame(rows), num_cols=("Per-unit kg CO₂e",)), unsafe_allow_html=True)
-    if not scens.empty:
-        d1, d2 = st.columns([3, 1])
-        target = d1.selectbox("Delete a saved scenario", scens["id"].tolist(),
-                              format_func=lambda i: scens.loc[scens["id"] == i, "name"].iloc[0], key="scen_del")
-        if d2.button("🗑 Delete", disabled=not can("scenario"), key="scen_del_btn"):
-            with closing(db()) as c, c:
-                nm = scens.loc[scens["id"] == target, "name"].iloc[0]
-                c.execute("DELETE FROM scenarios WHERE id=?", (int(target),))
-                log_event(c, ctx["actor"], ctx["role"], "scenario_deleted", "scenario", nm, "Removed")
-            flash("info", "Scenario deleted.")
-            st.rerun()
-
-    st.markdown("### Full contribution ledger (traceable)")
-    led = res["rows"][["stage", "item", "qty", "qty_unit", "factor", "factor_unit", "gwp", "unc_pct", "quality", "formula"]]
-    st.markdown(html_table(led.rename(columns={"gwp": "kg CO₂e", "unc_pct": "±%"}),
-                           num_cols=("qty", "factor", "kg CO₂e", "±%"), max_h=440), unsafe_allow_html=True)
-    st.download_button("⬇ Contributions CSV", res["rows"].to_csv(index=False).encode(),
-                       f"contributions_{prod['id']}.csv", "text/csv", key="an_csv")
-
-    with st.expander("📐 Methodology, boundaries & why no ML yet"):
-        st.latex(r"E_{\text{stage}}=\sum_i m_i \cdot EF_i \qquad E_{\text{use}}=P_{\text{yr}}\cdot L\cdot EF_{\text{grid}}")
-        st.latex(r"\text{credit}=-\,m_{\text{recycled}}\,(EF_{\text{virgin}}-EF_{\text{recycled}})\cdot q,\quad q=0.9")
-        st.markdown(
-            "- **Boundary:** cradle-to-grave; avoided-burden (credit) approach for recycling; single-product allocation; no cut-off applied.\n"
-            "- **Units:** GWP100, kg CO₂e per functional unit; transport in tonne-km; energy in kWh.\n"
-            "- **Scrap:** extra upstream input = mass × s/(1−s).\n"
-            "- **Factors:** illustrative demo set, versioned with rollback. Production requires licensed, dated factors (ecoinvent / GREET / DEFRA).\n"
-            "- **Why deterministic first:** lifecycle accounting is rule-based arithmetic — auditable and hand-checkable. "
-            "ML (e.g. anomaly detection on supplier declarations) is post-MVP and must be trained on real, permissioned data, "
-            "split by supplier/time, and compared against this baseline. Synthetic data validates plumbing only, never predictive claims.")
-
-
-# ============================================================================
-# PAGE — REVIEW & APPROVALS
-# ============================================================================
-def page_review(ctx):
-    strip(ctx)
-    prod, res = ctx["prod"], ctx["res"]
-    sec("Workflow", "Review & approvals",
-        "Draft → validation → review → approval → archive, with a documented exception path and full audit.")
-    checks, score, gate = validate_product(prod, ctx["lines"], ctx["legs"], ctx["factors"])
-    cur = prod["status"]
-    hl = {"draft": "#8A9A8E", "validated": "#2563EB", "in_review": "#D97706",
-          "approved": "#65A30D", "changes_requested": "#DC2626", "archived": "#7C3AED"}
-    nodes = []
-    for s in ["draft", "validated", "in_review", "approved", "archived"]:
-        fill = hl[s] if s == cur else "#FFFDF8"
-        font = "#FFFDF8" if s == cur else "#16281F"
-        nodes.append(f'"{s}" [label="{STATUS_LABEL[s]}", style="filled", fillcolor="{fill}", fontcolor="{font}"]')
-    dot = ('digraph G { rankdir=LR; bgcolor="transparent"; node [shape=box, style="rounded,filled", '
-           'fillcolor="#FFFDF8", fontcolor="#16281F", color="#C7BBA0", fontname="Inter", fontsize=11]; '
-           'edge [color="#7A8B7E", fontcolor="#5C6F63", fontname="Inter", fontsize=9]; '
-           + "; ".join(nodes) +
-           '; draft->validated [label="Analyst: validate"]; '
-           'validated->in_review [label="Analyst: submit"]; '
-           'in_review->approved [label="Reviewer: approve"]; '
-           'in_review->changes_requested [label="Reviewer: request changes"]; '
-           'changes_requested->validated [label="correct + revalidate"]; '
-           'approved->draft [label="reopen"]; approved->archived [label="Admin: archive"]; '
-           'archived->draft [label="Admin: unarchive"]; '
-           'exception [label="Exception path\\nquality gate failed", shape=note, fillcolor="#FDF3E2", fontcolor="#B45309", color="#D97706"]; '
-           'validated->exception [style=dashed, label="score < gate"]; '
-           'exception->in_review [style=dashed, label="reason + audit"]; }')
-    st.graphviz_chart(dot, **width_kwargs(st.graphviz_chart))
-
-    c1, c2 = st.columns([2, 3])
-    with c1:
-        st.markdown(f'#### {htmlmod.escape(prod["name"])}')
-        st.markdown(f'{badge(cur)} &nbsp; <span class="chip">quality {score*100:.0f}/100 · {grade(score)}</span> '
-                    f'<span class="chip">gate {"PASS" if gate else "FAIL"}</span>', unsafe_allow_html=True)
-        st.markdown(kpi("Per-unit result under review", f'{res["total"]:,.1f} kg CO₂e',
-                        f'factors {ctx["version"]} · run {ctx["run_id"]}', "lime"), unsafe_allow_html=True)
-    with c2:
-        st.markdown("#### Validation checks")
-        items = []
-        icons = {"ok": "✔", "warning": "⚠", "error": "✖"}
-        for ck in checks:
-            items.append(f'<li><span class="b b-{ck["level"]}">{icons[ck["level"]]} {ck["level"]}</span> '
-                         f'{htmlmod.escape(ck["msg"])}</li>')
-        st.markdown('<ul class="tt-feed">' + "".join(items) + "</ul>", unsafe_allow_html=True)
-
-    st.markdown("#### Actions")
-    has_errors = any(c["level"] == "error" for c in checks)
-    comment = st.text_input("Reviewer comment / exception reason", key="rev_comment",
-                            placeholder="Required for request-changes and quality-gate exceptions.")
-    a1, a2, a3, a4 = st.columns(4)
-    if cur in ("draft", "changes_requested"):
-        if a1.button("✔ Validate & mark", disabled=not can("validate") or has_errors, type="primary", key="act_val"):
-            try:
-                set_status(prod["id"], "validated", ctx["actor"], ctx["role"], "Structural checks passed")
-                flash("success", "Record validated.")
-                st.rerun()
-            except (PermissionError, ValueError) as e:
-                st.error(str(e))
-    if cur == "validated":
-        need_exception = not gate and not has_errors
-        ok = can("submit") and not has_errors and (gate or (need_exception and bool(comment.strip())))
-        if a2.button("➤ Submit for review", disabled=not ok, type="primary", key="act_sub",
-                     help="Gate failed: provide an exception reason." if need_exception else None):
-            try:
-                note = comment.strip() if need_exception else (comment.strip() or "Submitted for review")
-                set_status(prod["id"], "in_review", ctx["actor"], ctx["role"],
-                           ("EXCEPTION: " + note) if need_exception else note)
-                if need_exception:
-                    with closing(db()) as c, c:
-                        log_event(c, ctx["actor"], ctx["role"], "exception_submit", "product", prod["id"], note)
-                flash("success", "Submitted for review." + (" Exception documented." if need_exception else ""))
-                st.rerun()
-            except (PermissionError, ValueError) as e:
-                st.error(str(e))
-        if need_exception:
-            st.warning(f"Quality gate failed ({score*100:.0f} < {QUALITY_GATE*100:.0f}). "
-                       "Enter an exception reason above to submit — it will be audited and shown to the reviewer.")
-    if cur == "in_review":
-        if a2.button("✔ Approve", disabled=not can("approve"), type="primary", key="act_app"):
-            try:
-                set_status(prod["id"], "approved", ctx["actor"], ctx["role"], comment.strip() or "Approved")
-                flash("success", "Record approved.")
-                st.rerun()
-            except (PermissionError, ValueError) as e:
-                st.error(str(e))
-        if a3.button("↩ Request changes", disabled=not can("approve") or not comment.strip(), key="act_chg",
-                     help="A comment is required."):
-            try:
-                set_status(prod["id"], "changes_requested", ctx["actor"], ctx["role"], comment.strip())
-                flash("warning", "Changes requested — record returned for correction.")
-                st.rerun()
-            except (PermissionError, ValueError) as e:
-                st.error(str(e))
-    if cur in ("approved", "archived"):
-        if a3.button("🔓 Reopen", disabled=not can("reopen"), key="act_reopen"):
-            try:
-                set_status(prod["id"], "draft", ctx["actor"], ctx["role"], comment.strip() or "Reopened for correction")
-                flash("info", "Record reopened as draft.")
-                st.rerun()
-            except (PermissionError, ValueError) as e:
-                st.error(str(e))
-    if cur == "approved":
-        arch_ok = st.checkbox("Confirm archive", key="arch_conf")
-        if a4.button("🗄 Archive", disabled=not can("archive") or not arch_ok, key="act_arch"):
-            try:
-                set_status(prod["id"], "archived", ctx["actor"], ctx["role"], "Archived")
-                flash("info", "Record archived (read-only).")
-                st.rerun()
-            except (PermissionError, ValueError) as e:
-                st.error(str(e))
-
-    st.markdown("#### Manual overrides (Reviewer / Administrator)")
-    o1, o2, o3 = st.columns([2, 1, 2])
-    o_stage = o1.selectbox("Stage", STAGES, key="ov_stage")
-    o_delta = o2.number_input("Adjustment (kg CO₂e)", -1000.0, 1000.0, 0.0, step=0.5, key="ov_delta")
-    o_reason = o3.text_input("Reason (required, audited)", key="ov_reason")
-    if st.button("⚠ Apply override", disabled=not can("override") or not o_reason.strip() or o_delta == 0, key="ov_add"):
-        with closing(db()) as c, c:
-            c.execute("INSERT INTO overrides(product_id,stage,delta_kg,reason,actor,role,ts,active) VALUES (?,?,?,?,?,?,?,1)",
-                      (prod["id"], o_stage, o_delta, o_reason.strip(), ctx["actor"], ctx["role"], utcnow()))
-            log_event(c, ctx["actor"], ctx["role"], "override_added", "product", prod["id"],
-                      f"{o_stage} {o_delta:+.1f} kg — {o_reason.strip()}")
-        flash("warning", f"Override applied: {o_stage} {o_delta:+.1f} kg CO₂e. Included in all outputs and reports.")
-        st.rerun()
-    ovs = qdf("SELECT * FROM overrides WHERE product_id=? AND active=1 ORDER BY id DESC", (prod["id"],))
-    if ovs.empty:
-        st.caption("No active overrides — the deterministic result stands.")
-    else:
-        for _, o in ovs.iterrows():
-            r1, r2 = st.columns([5, 1])
-            r1.markdown(f'<span class="b b-warning">override</span> **{o["stage"]} {o["delta_kg"]:+.1f} kg** — '
-                        f'{htmlmod.escape(o["reason"])} · {htmlmod.escape(o["actor"])} · {o["ts"][:16]}',
-                        unsafe_allow_html=True)
-            if r2.button("Revoke", key=f"ov_rev_{o['id']}", disabled=not can("override")):
-                with closing(db()) as c, c:
-                    c.execute("UPDATE overrides SET active=0 WHERE id=?", (int(o["id"]),))
-                    log_event(c, ctx["actor"], ctx["role"], "override_revoked", "product", prod["id"], o["reason"])
-                flash("info", "Override revoked.")
-                st.rerun()
-
-    st.markdown("#### Approval history")
-    hist = qdf("SELECT ts, actor, role, from_status, to_status, comment FROM approvals WHERE product_id=? ORDER BY id DESC",
-               (prod["id"],))
-    if hist.empty:
-        st.caption("No transitions recorded yet.")
-    else:
-        st.markdown(html_table(hist), unsafe_allow_html=True)
-
-    with st.expander("🔍 Result explanation panel — inputs, rules, lineage, reviewer status"):
-        e1, e2 = st.columns(2)
-        with e1:
-            st.markdown("**Inputs applied**")
-            inp = pd.DataFrame([
-                {"Input": "Lifetime (yr)", "Value": f'{prod["lifetime_yr"]} × {ctx["params"]["life_mult"]:.2f}'},
-                {"Input": "Use energy (kWh/yr)", "Value": f'{prod["use_kwh_yr"]} × {ctx["params"]["use_mult"]:.2f}'},
-                {"Input": "Grid (kg/kWh)", "Value": ctx["params"]["grid"]},
-                {"Input": "Recycled content", "Value": f'{ctx["params"]["recycled_content"]}%'},
-                {"Input": "EoL recycling / incineration", "Value": f'{ctx["params"]["eol_recycle"]}% / {ctx["params"]["incin_share"]}%'},
-                {"Input": "Scrap rate", "Value": f'{ctx["params"]["scrap"]}%'},
-                {"Input": "Rules / factor version", "Value": f'engine v{ENGINE_VERSION} · {ctx["version"]}'},
-            ])
-            st.markdown(html_table(inp, max_h=300), unsafe_allow_html=True)
-        with e2:
-            st.markdown("**Key contributors & uncertainty**")
-            top = res["rows"].reindex(res["rows"]["gwp"].abs().sort_values(ascending=False).index).head(5)
-            st.markdown(html_table(top[["item", "gwp", "unc_pct", "formula"]].rename(columns={"gwp": "kg CO₂e", "unc_pct": "±%"}),
-                                   num_cols=("kg CO₂e", "±%"), max_h=300), unsafe_allow_html=True)
-            st.caption(f'Reviewer status: {STATUS_LABEL[cur]} · quality {score*100:.0f}/100 · '
-                       f'MC P5–P95 {ctx["mc"]["p5"]:,.1f}–{ctx["mc"]["p95"]:,.1f} kg.')
-        st.markdown(f'<div class="tt-note"><b>Lineage:</b> synthetic://fixtures/v1 → {htmlmod.escape(prod["source"])} → '
-                    f'engine v{ENGINE_VERSION} → factors {ctx["version"]} → run {ctx["run_id"]}. '
-                    f'Every contribution row carries its formula, factor and quality tag.</div>', unsafe_allow_html=True)
-
-
-# ============================================================================
-# PAGE — REPORTS
-# ============================================================================
-REPORT_CSS = ("@import url('https://fonts.googleapis.com/css2?family=Fraunces:wght@600;700&family=Inter:wght@400;600&display=swap');"
-              "body{font-family:Inter,Arial,sans-serif;margin:40px auto;max-width:920px;color:#16281F;background:#F7F2E7;}"
-              "h1{font-family:Fraunces,Georgia,serif;font-size:26px;margin:0;} h2{font-family:Fraunces,Georgia,serif;font-size:17px;margin:26px 0 8px;border-bottom:2px solid #123B2E;padding-bottom:4px;}"
-              ".brand{color:#3F7A0E;font-weight:700;letter-spacing:.12em;font-size:12px;text-transform:uppercase;}"
-              ".meta{color:#68796E;font-size:12px;margin:6px 0 18px;}"
-              "table{border-collapse:collapse;width:100%;margin:8px 0;background:#FFFDF8;} th,td{border:1px solid #D9CFBA;padding:6px 10px;font-size:12px;text-align:left;}"
-              "th{background:#123B2E;color:#F7F2E7;} .num{text-align:right;}"
-              ".kpis{display:flex;gap:12px;margin:14px 0;} .k{flex:1;border:1.5px solid #C7BBA0;border-radius:10px;padding:12px;background:#FFFDF8;box-shadow:3px 3px 0 rgba(22,40,31,.07);}"
-              ".k b{display:block;font-size:20px;font-family:Fraunces,Georgia,serif;} .k span{font-size:11px;color:#68796E;text-transform:uppercase;letter-spacing:.08em;}"
-              ".warn{background:#FDF3E2;border:1px solid #F3D19B;border-radius:8px;padding:10px;font-size:12px;margin:8px 0;}"
-              "footer{margin-top:30px;font-size:11px;color:#68796E;border-top:1px solid #D9CFBA;padding-top:10px;}")
-
-
-def build_report(ctx, include):
-    prod, res, mc = ctx["prod"], ctx["res"], ctx["mc"]
-    checks, score, gate = validate_product(prod, ctx["lines"], ctx["legs"], ctx["factors"])
-    approvals = qdf("SELECT ts,actor,role,from_status,to_status,comment FROM approvals WHERE product_id=? ORDER BY id", (prod["id"],))
-    meta = {"product": prod["name"], "product_id": prod["id"], "functional_unit": prod["functional_unit"],
-            "status": STATUS_LABEL[prod["status"]], "run_id": ctx["run_id"], "engine": ENGINE_VERSION,
-            "factors": ctx["version"], "generated": utcnow(), "generated_by": f'{ctx["actor"]} ({ctx["role"]})',
-            "data_label": "SYNTHETIC DEMO DATA"}
-    bundle = {"meta": meta, "params": ctx["params"],
-              "stages": {k: round(v, 3) for k, v in res["stages"].items()},
-              "total_kg_co2e": round(res["total"], 3), "annual_t_co2e": round(res["annual"] / 1000, 3),
-              "quality_score": round(score, 3), "gate_pass": gate,
-              "flags": [f"{l}: {m}" for l, m in res["flags"]]}
-    if include["contributions"]:
-        bundle["contributions"] = json.loads(res["rows"].to_json(orient="records"))
-    if include["uncertainty"]:
-        unc = {k: round(mc[k], 3) for k in ("p5", "p50", "p95", "mean", "std")}
-        unc.update({"n": mc["n"], "seed": ctx["params"]["seed"]})
-        bundle["uncertainty"] = unc
-    if include["approvals"]:
-        bundle["approvals"] = json.loads(approvals.to_json(orient="records"))
-        bundle["overrides"] = json.loads(qdf("SELECT stage,delta_kg,reason,actor,ts FROM overrides WHERE product_id=? AND active=1",
-                                             (prod["id"],)).to_json(orient="records"))
-    if include["audit"]:
-        bundle["audit_tail"] = json.loads(qdf("SELECT ts,actor,role,event,details FROM audit_events ORDER BY id DESC LIMIT 25").to_json(orient="records"))
-
-    def tbl(df, num=()):
-        th = "".join(f"<th>{htmlmod.escape(str(c))}</th>" for c in df.columns)
-        trs = []
-        for _, r in df.iterrows():
-            cells = []
-            for c, v in r.items():
-                txt = f"{v:,.2f}" if isinstance(v, float) else str(v)
-                cls = "num" if c in num else ""
-                cells.append(f'<td class="{cls}">{htmlmod.escape(txt)}</td>')
-            trs.append("<tr>" + "".join(cells) + "</tr>")
-        return f"<table><thead><tr>{th}</tr></thead><tbody>{''.join(trs)}</tbody></table>"
-
-    stage_df = pd.DataFrame([{"Stage": s, "kg CO₂e": round(v, 2)} for s, v in res["stages"].items()])
-    parts = [f'<!doctype html><html><head><meta charset="utf-8"><title>TerraTrace report — {htmlmod.escape(prod["name"])}</title>'
-             f'<style>{REPORT_CSS}</style></head><body>',
-             '<div class="brand">🌿 TerraTrace · Lifecycle Impact Studio</div>',
-             f'<h1>{htmlmod.escape(prod["name"])}</h1>',
-             f'<div class="meta">Run {meta["run_id"]} · engine v{ENGINE_VERSION} · factors {ctx["version"]} · '
-             f'{meta["generated"]} · {htmlmod.escape(meta["generated_by"])} · status: {meta["status"]} · <b>SYNTHETIC DEMO DATA</b></div>',
-             '<div class="kpis">'
-             f'<div class="k"><span>Per-unit net</span><b>{res["total"]:,.1f} kg CO₂e</b></div>'
-             f'<div class="k"><span>Annual program</span><b>{res["annual"]/1000:,.1f} t CO₂e</b></div>'
-             f'<div class="k"><span>P5–P95</span><b>{mc["p5"]:,.1f} – {mc["p95"]:,.1f}</b></div>'
-             f'<div class="k"><span>Data quality</span><b>{score*100:.0f}/100 · {grade(score)}</b></div></div>',
-             "<h2>Lifecycle stage summary</h2>" + tbl(stage_df, num=("kg CO₂e",)),
-             "<h2>Scenario assumptions</h2>" + tbl(pd.DataFrame([{"Parameter": k, "Value": v} for k, v in ctx["params"].items()])),
-             "<h2>Data quality & limitations</h2>" + "".join(f'<div class="warn">{htmlmod.escape(l.upper())}: {htmlmod.escape(m)}</div>' for l, m in res["flags"])]
-    if include["contributions"]:
-        parts.append("<h2>Contribution ledger (traceable formulas)</h2>" +
-                     tbl(res["rows"][["stage", "item", "qty", "qty_unit", "factor", "gwp", "quality", "formula"]]
-                         .rename(columns={"gwp": "kg CO₂e"}), num=("qty", "factor", "kg CO₂e")))
-    if include["approvals"] and not approvals.empty:
-        parts.append("<h2>Approval chain</h2>" + tbl(approvals))
-    if include["audit"] and "audit_tail" in bundle:
-        parts.append("<h2>Audit trail (latest 25 events)</h2>" +
-                     tbl(pd.DataFrame(bundle["audit_tail"])))
-    parts.append("<footer>Decision-support estimate produced with illustrative, versioned demo factors and synthetic activity data. "
-                 "Not a certified LCA, EPD or regulatory filing. Boundary: cradle-to-grave, avoided-burden recycling credits (q=0.9), "
-                 "GWP100. Replace factors with a licensed database and obtain qualified review before external use.</footer></body></html>")
-    return bundle, "".join(parts)
-
-
-def _log_export(pid, fmt):
-    ss = st.session_state
-    with closing(db()) as c, c:
-        log_event(c, ss.get("actor_name", "?"), ss.get("role", "?"), "export", "product", pid, f"Format: {fmt}")
-
-
-def page_reports(ctx):
-    strip(ctx)
-    sec("Export", "Reports & exports",
-        "Every export is logged to the audit trail and carries run ID, factor version, assumptions and limitations.")
-    linkedin_share_panel(ctx)
-    inc = {
-        "contributions": st.checkbox("Contribution ledger (formulas)", True, key="rp_c"),
-        "uncertainty": st.checkbox("Monte Carlo uncertainty", True, key="rp_u"),
-        "approvals": st.checkbox("Approvals & overrides", True, key="rp_a"),
-        "audit": st.checkbox("Audit trail (latest 25)", False, key="rp_t"),
-    }
-    if st.button("⚙ Generate report", type="primary", disabled=not can("export"), key="rp_gen"):
-        st.session_state["report"] = build_report(ctx, inc)
-    if "report" not in st.session_state:
-        st.markdown('<div class="tt-note">Click <b>Generate report</b> — the current scenario, uncertainty run and approval '
-                    'state are bundled with full traceability.</div>', unsafe_allow_html=True)
-    else:
-        bundle, html_doc = st.session_state["report"]
-        r = ctx["res"]
-        st.markdown('<div class="tt-kpi-grid">' + "".join([
-            kpi("Per-unit", f'{r["total"]:,.1f} kg', "net CO₂e", "lime"),
-            kpi("Annual", f'{r["annual"]/1000:,.1f} t', "program CO₂e", "teal"),
-            kpi("Run", bundle["meta"]["run_id"], f'factors {ctx["version"]}', "sky"),
-            kpi("Status", STATUS_LABEL[ctx["prod"]["status"]], bundle["meta"]["generated"][:16], "amber"),
-        ]) + "</div>", unsafe_allow_html=True)
-        pid = ctx["prod"]["id"]
-        d1, d2, d3 = st.columns(3)
-        d1.download_button("⬇ HTML report", html_doc, f"terratrace_{pid}.html", "text/html",
-                           on_click=_log_export, args=(pid, "HTML"), type="primary", **width_kwargs(st.download_button))
-        d2.download_button("⬇ CSV contributions", r["rows"].to_csv(index=False).encode(),
-                           f"terratrace_{pid}.csv", "text/csv",
-                           on_click=_log_export, args=(pid, "CSV"), **width_kwargs(st.download_button))
-        d3.download_button("⬇ JSON bundle", json.dumps(bundle, indent=2),
-                           f"terratrace_{pid}.json", "application/json",
-                           on_click=_log_export, args=(pid, "JSON"), **width_kwargs(st.download_button))
-        with st.expander("Preview stage summary"):
-            st.markdown(html_table(pd.DataFrame([{"Stage": s, "kg CO₂e": round(v, 2)} for s, v in r["stages"].items()]),
-                                   num_cols=("kg CO₂e",)), unsafe_allow_html=True)
-    st.markdown("#### Portfolio export")
-    port = pd.DataFrame([{
-        "product_id": p["id"], "name": p["name"], "status": p["status"],
-        "per_unit_kg_co2e": round(ctx["results"][p["id"]]["total"], 2),
-        "annual_t_co2e": round(ctx["results"][p["id"]]["annual"] / 1000, 2),
-        "quality": round(ctx["results"][p["id"]]["quality"], 2),
-        **{f"stage_{s.lower().replace(' ', '_').replace('-', '_')}": round(ctx["results"][p["id"]]["stages"][s], 2) for s in STAGES},
-    } for p in ctx["products"]])
-    st.markdown(html_table(port, num_cols=tuple(c for c in port.columns if c not in ("product_id", "name", "status"))),
-                unsafe_allow_html=True)
-    st.download_button("⬇ Portfolio CSV", port.to_csv(index=False).encode(), "terratrace_portfolio.csv",
-                       "text/csv", on_click=_log_export, args=("portfolio", "CSV"), key="rp_port",
-                       disabled=not can("export"), **width_kwargs(st.download_button))
-
-
-# ============================================================================
-# PAGE — GOVERNANCE
-# ============================================================================
-def run_self_tests():
-    results = []
-    F = resolve_factors("FCT-2026.1")
-    P = dict(DEFAULT_PARAMS, scrap=0, recycled_content=0, eol_recycle=0, incin_share=0)
-    mini = {"lifetime_yr": 10, "use_kwh_yr": 100, "assembly_kwh": 0, "gas_kwh": 0, "base_volume": 1}
-    lines = [{"material_code": "steel", "mass_kg": 2.0, "supplier": "T", "quality": "measured"}]
-
-    def check(name, fn):
+# ══════════════════════════════ SELF-CHECK SUITE (real, runnable) ══════════════════════════════
+def run_self_checks() -> list:
+    F = base_factors()
+    fx = fixture_product()
+    r = compute_impacts(fx, F)
+    close = math.isclose
+    def t(name, fn):
         try:
             ok, detail = fn()
-        except Exception as e:
-            ok, detail = False, f"raised {type(e).__name__}: {e}"
-        results.append({"Test": name, "Result": "PASS" if ok else "FAIL", "Detail": detail})
+        except Exception as ex:
+            ok, detail = False, f"{type(ex).__name__}: {ex}"
+        return {"check": name, "passed": bool(ok), "detail": detail}
+    def materials():
+        v = r["stages"]["Raw materials"]["ghg"]
+        return close(v, 4.2, rel_tol=1e-9), f"2 kg steel × 2.10 = {v:.3f} kg (expect 4.200)"
+    def use():
+        v = r["stages"]["Use phase"]["ghg"]
+        return close(v, 380.0, rel_tol=1e-9), f"100 kWh/y × 10 y × 0.38 = {v:.2f} (expect 380.00)"
+    def transport():
+        v = r["stages"]["Transport"]["ghg"]
+        return close(v, 0.022, rel_tol=1e-9), f"0.002 t × 100 km × 0.11 = {v:.4f} (expect 0.0220)"
+    def eol():
+        v = r["stages"]["End of life"]["ghg"]
+        return close(v, -2.012, rel_tol=1e-9), f"credit −2.016 + landfill 0.004 = {v:.4f} (expect −2.0120)"
+    def total():
+        return close(r["total_ghg"], 382.21, rel_tol=1e-9), f"hand total 382.21 vs engine {r['total_ghg']:.4f}"
+    def blend():
+        q = copy.deepcopy(fx)
+        q["bom"] = [{"component": "X", "material": "Aluminium", "mass_kg": 10, "recycled_pct": 50, "quality": "measured"}]
+        v = compute_impacts(q, F)["stages"]["Raw materials"]["ghg"]
+        return close(v, 61.0, rel_tol=1e-9), f"10 kg Al @50% recycled = {v:.2f} (expect 61.00)"
+    def energy():
+        v = r["stages"]["Use phase"]["mj"]
+        return close(v, 9500.0, rel_tol=1e-9), f"1,000 kWh × 9.5 MJ/kWh = {v:.0f} MJ (expect 9,500)"
+    def eol_sum():
+        q = copy.deepcopy(fx); q["eol"]["recycle_pct"] = 110
+        return any(i["field"] == "eol" and i["severity"] == "error" for i in validate_product(q)), "130% EoL sum rejected"
+    def neg_mass():
+        q = copy.deepcopy(fx); q["bom"][0]["mass_kg"] = -1
+        return any(i["severity"] == "error" for i in validate_product(q)), "negative mass rejected"
+    def unknown_mat():
+        q = copy.deepcopy(fx); q["bom"][0]["material"] = "Unobtainium"
+        return any("unknown material" in i["message"] for i in validate_product(q)), "unknown material rejected"
+    def zero_life():
+        q = copy.deepcopy(fx); q["lifetime_years"] = 0
+        return any(i["field"] == "lifetime_years" for i in validate_product(q)), "zero lifetime rejected"
+    def repro():
+        d1, d2 = result_digest(r), result_digest(compute_impacts(fixture_product(), base_factors()))
+        return d1 == d2, f"digest {d1} == {d2}"
+    def mc_seed():
+        a, b, c = mc_draws(r["lines"], 512, 7), mc_draws(r["lines"], 512, 7), mc_draws(r["lines"], 512, 8)
+        ok = np.allclose(a, b) and not np.allclose(np.percentile(a, 50), np.percentile(c, 50))
+        return ok, f"seed 7 P50 {np.percentile(a,50):.2f} reproducible; seed 8 differs"
+    def perms():
+        ok = (not role_can("Stakeholder", "approve") and not role_can("Analyst", "approve")
+              and role_can("Reviewer", "approve") and role_can("Administrator", "restore"))
+        return ok, "stakeholder/analyst cannot approve; reviewer can; admin can restore"
+    def imp_valid():
+        res = parse_import(pd.read_csv(io.StringIO(VALID_SAMPLE)), set(), F)
+        ok = len(res["valid_products"]) == 2 and all(
+            not [i for i in validate_product(p) if i["severity"] == "error"] for p in res["valid_products"])
+        return ok, f"{len(res['valid_products'])} valid products, 0 errors"
+    def imp_broken():
+        res = parse_import(pd.read_csv(io.StringIO(BROKEN_SAMPLE)), {"P-LED-001"}, F)
+        flat = " | ".join(m for e in res["row_errors"] for m in e)
+        ok = ("P-BAD-01" in res["rejected_groups"] and "P-LED-001" in res["rejected_groups"]
+              and "duplicate" in flat and "unknown material" in flat and "already exists" in flat)
+        return ok, f"{len(res['rejected_groups'])} groups rejected with actionable row errors"
+    def scen_renorm():
+        s = scenario_defaults(fx); s["eol_target"] = 90
+        q, _ = apply_scenario(fx, s, F)
+        tot = q["eol"]["recycle_pct"] + q["eol"]["incinerate_pct"] + q["eol"]["landfill_pct"]
+        return close(tot, 100.0, abs_tol=1e-6), f"scenario EoL renormalized to {tot:.2f}%"
+    def audit_ev():
+        ev = make_event("A", "Analyst", "create", "product", "T-1", "x")
+        return all(k in ev for k in ("ts", "actor", "role", "action", "entity_id")), "audit event carries full provenance"
+    return [t("Materials — hand example", materials), t("Use phase — hand example", use),
+            t("Transport — hand example", transport), t("End-of-life credit — hand example", eol),
+            t("End-to-end total 382.21 kg", total), t("Recycled-content blend", blend),
+            t("Energy accounting (MJ)", energy), t("Validation: EoL shares ≠ 100%", eol_sum),
+            t("Validation: negative mass", neg_mass), t("Validation: unknown material", unknown_mat),
+            t("Validation: zero lifetime", zero_life), t("Deterministic reproducibility", repro),
+            t("Monte Carlo seed reproducibility", mc_seed), t("Role permission matrix", perms),
+            t("Import: valid sample accepted", imp_valid), t("Import: broken sample rejected", imp_broken),
+            t("Scenario EoL renormalization", scen_renorm), t("Audit event provenance", audit_ev)]
 
-    def t1():
-        r = assess(mini, lines, [], P, F)
-        v = r["stages"]["Materials"]
-        return abs(v - 4.92) < 1e-9, f"2 kg × 2.46 = {v:.4f} (expected 4.92)"
+# ══════════════════════════════ CSS / THEME ══════════════════════════════
+CSS = """
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=Inter:wght@400;600;700&display=swap');
+html, body, [class*="css"] { font-family: 'Inter', 'Segoe UI', sans-serif; }
+h1, h2, h3 { font-family: 'Space Grotesk', 'Segoe UI', sans-serif !important; color: #0E3B2E; letter-spacing: -0.3px; }
+.stApp { background: #F6F5EF; }
+#MainMenu, footer { visibility: hidden; }
+[data-testid="stHeader"] { background: transparent; }
+*::-webkit-scrollbar { width: 10px; height: 10px; }
+*::-webkit-scrollbar-track { background: #E9EEE6; border-radius: 8px; }
+*::-webkit-scrollbar-thumb { background: #2E7D5B; border-radius: 8px; border: 2px solid #E9EEE6; }
+*::-webkit-scrollbar-thumb:hover { background: #3FA372; }
+* { scrollbar-width: thin; scrollbar-color: #2E7D5B #E9EEE6; }
+[data-testid="stSidebar"] { background: linear-gradient(175deg, #0B3B2E 0%, #124D3B 60%, #17604A 100%); }
+[data-testid="stSidebar"] p, [data-testid="stSidebar"] span, [data-testid="stSidebar"] label,
+[data-testid="stSidebar"] .stMarkdown, [data-testid="stSidebar"] caption { color: #DFF0E4 !important; }
+[data-testid="stSidebar"] h1, [data-testid="stSidebar"] h2, [data-testid="stSidebar"] h3 { color: #FFFFFF !important; }
+[data-testid="stSidebar"] hr { border-color: rgba(255,255,255,0.18); }
+[data-testid="stMetric"] { background: #FFFFFF; border: 1px solid #E1E8DD; border-left: 5px solid #2E7D5B;
+  border-radius: 12px; padding: 12px 16px; box-shadow: 0 1px 4px rgba(14,59,46,0.07); }
+[data-testid="stMetricLabel"] { color: #4A5A50; font-weight: 600; }
+[data-testid="stMetricValue"] { color: #0E3B2E; }
+.stButton > button, .stDownloadButton > button { border-radius: 10px; border: 1px solid #C8DCC9;
+  font-weight: 600; color: #14231C; background: #FFFFFF; transition: all .15s ease; }
+.stButton > button:hover, .stDownloadButton > button:hover { border-color: #2E7D5B; color: #0E3B2E;
+  box-shadow: 0 2px 10px rgba(46,125,91,0.25); transform: translateY(-1px); }
+button[kind="primary"], [data-testid="stBaseButton-primary"] { background: linear-gradient(135deg, #1E6B4F, #2E8B62) !important;
+  color: #FFFFFF !important; border: none !important; }
+button[kind="primary"]:hover, [data-testid="stBaseButton-primary"]:hover { filter: brightness(1.1); }
+.stTabs [data-baseweb="tab-list"] { gap: 6px; }
+.stTabs [data-baseweb="tab"] { font-weight: 600; border-radius: 8px 8px 0 0; }
+.stTabs [aria-selected="true"] { color: #0E3B2E !important; }
+.eco-hero { background: linear-gradient(120deg, #0B3B2E 0%, #14614A 42%, #1E7A55 72%, #4C9A44 100%);
+  border-radius: 18px; padding: 26px 30px; color: #F2F8EF; position: relative; overflow: hidden; margin-bottom: 14px; }
+.eco-hero::after { content: ''; position: absolute; right: -70px; top: -70px; width: 260px; height: 260px;
+  background: radial-gradient(circle, rgba(168,225,12,0.35) 0%, rgba(168,225,12,0) 70%); }
+.eco-hero::before { content: ''; position: absolute; left: 30%; bottom: -90px; width: 300px; height: 200px;
+  background: radial-gradient(circle, rgba(45,156,219,0.25) 0%, rgba(45,156,219,0) 70%); }
+.eco-hero h1 { color: #FFFFFF !important; margin: 0 0 6px 0; font-size: 30px; }
+.eco-hero p { color: #CFE8D2; margin: 0; font-size: 14px; max-width: 760px; }
+.eco-chip { display: inline-block; background: rgba(255,255,255,0.14); border: 1px solid rgba(255,255,255,0.25);
+  color: #EAF6E6; padding: 3px 12px; border-radius: 999px; font-size: 12px; font-weight: 600; margin: 10px 6px 0 0; }
+.eco-callout { background: linear-gradient(100deg, #FFFFFF, #F2F8EC); border: 1px solid #D8E6CF;
+  border-left: 5px solid #A8E10C; border-radius: 12px; padding: 14px 18px; margin: 8px 0; }
+.eco-warnchip { background: #FFF3CD; color: #7A5A00; border: 1px solid #F2A007; padding: 3px 12px;
+  border-radius: 999px; font-size: 12px; font-weight: 700; }
+div[data-testid="stExpander"] { background: #FFFFFF; border: 1px solid #E1E8DD; border-radius: 12px; }
+</style>
+"""
 
-    def t2():
-        r = assess(mini, lines, [], P, F)
-        v = r["stages"]["Use phase"]
-        return abs(v - 380.0) < 1e-9, f"100 kWh/yr × 10 yr × 0.38 = {v:.2f} (expected 380)"
+WORKFLOW_DOT = """
+digraph G {
+  rankdir=LR; bgcolor="transparent";
+  node [shape=box, style="rounded,filled", fontname="Helvetica", fontsize=11];
+  Draft [fillcolor="#E8ECE7"]; Validated [fillcolor="#D6EAF8"];
+  "In Review" [fillcolor="#FDEBD0"]; Approved [fillcolor="#D5F5E3"];
+  "Changes Requested" [fillcolor="#FADBD8"]; Archived [fillcolor="#E5E7E9"];
+  Exception [fillcolor="#FFF3CD", shape=octagon];
+  Draft -> Validated [label="Analyst: validate (0 errors)"];
+  Validated -> "In Review" [label="Analyst: submit"];
+  "In Review" -> Approved [label="Reviewer: approve"];
+  "In Review" -> "Changes Requested" [label="Reviewer: note required"];
+  "Changes Requested" -> Draft [label="Analyst: correct"];
+  Draft -> Exception [label="missing / conflicting / out-of-range", color="#E4572E"];
+  Exception -> Draft [label="fix & revalidate", color="#E4572E"];
+  Approved -> Archived [label="Admin"];
+  Approved -> Draft [label="Admin: reopen"];
+}"""
 
-    def t3():
-        r = assess(mini, lines, [], dict(P, eol_recycle=80), F)
-        return r["stages"]["Credits"] < 0, f'credit = {r["stages"]["Credits"]:.3f} kg (must be negative)'
+ERD_DOT = """
+digraph E {
+  rankdir=LR; bgcolor="transparent"; node [shape=record, fontname="Helvetica", fontsize=10];
+  products [label="{products|id (PK)\\lname / category\\lstatus / lifetime_years\\lschema_version\\lcreated / updated_utc\\lsource (provenance)\\l}"];
+  bom_lines [label="{bom_lines|product_id (FK)\\lcomponent / material\\lmass_kg / recycled_pct\\lquality pedigree\\l}"];
+  transport_legs [label="{transport_legs|product_id (FK)\\lmode / distance_km\\l}"];
+  factor_versions [label="{factor_versions|version (PK)\\lmaterials / grids / transport\\lpublished_by / ts\\l}"];
+  import_batches [label="{import_batches|id (PK)\\lfile / sha256\\lraw_text preserved\\lrow counts\\l}"];
+  audit_events [label="{audit_events|ts / actor / role\\laction / entity_id\\ldetails\\l}"];
+  scenarios [label="{scenarios|id (PK)\\lproduct_id (FK)\\lparams / delta_ghg\\l}"];
+  users [label="{users (roles)|Administrator\\lAnalyst / Reviewer\\lStakeholder\\l}"];
+  products -> bom_lines; products -> transport_legs; products -> scenarios;
+  import_batches -> products [label="lineage"];
+  factor_versions -> products [label="calc version"];
+  users -> audit_events; products -> audit_events;
+}"""
 
-    def t4():
-        r = assess(mini, lines, [], P, F)
-        a, b = monte_carlo(r, F, 400, 42), monte_carlo(r, F, 400, 42)
-        return a["p50"] == b["p50"], f'seeded P50 {a["p50"]:.4f} == {b["p50"]:.4f}'
+# ══════════════════════════════ STATE & SIDEBAR ══════════════════════════════
+def init_state():
+    if "db" not in st.session_state:
+        st.session_state.db = build_demo_db()
+    st.session_state.setdefault("role", "Administrator")
+    st.session_state.setdefault("intro_done", False)
+    st.session_state.setdefault("selected_product", None)
+    st.session_state.setdefault("qa_results", None)
+    st.session_state.setdefault("import_payload", None)
+    st.session_state.setdefault("report_cache", None)
 
-    def t5():
-        bad = pd.read_csv(io.StringIO(BAD_CSV))
-        out = validate_import(bad, set(), "Append", F)
-        n = int((out["_status"] == "error").sum())
-        return n >= 6, f"{n} malformed rows rejected with messages (expected ≥6)"
+NAV = ["🏠 Overview", "📦 Products", "📊 Impact Analysis", "🔀 Scenario Lab",
+       "📥 Import & Validate", "✅ Review & Approvals", "📄 Reports & Export", "🛡️ Governance & QA"]
 
-    def t6():
-        good = pd.read_csv(io.StringIO(TEMPLATE_CSV))
-        out = validate_import(good, set(), "Append", F)
-        return bool((out["_status"] == "valid").all()), "template file: all rows valid"
+def sidebar():
+    with st.sidebar:
+        st.markdown("## 🌿 EcoLedger LCA")
+        st.caption("Lifecycle impact, end to end — decision support")
+        st.selectbox("Active role", list(USERS), key="role",
+                     help="Permissions are enforced in every mutation handler, not only in the UI.")
+        st.caption(f"Signed in as **{current_user()}**")
+        st.divider()
+        choice = st.radio("Navigation", NAV, key="nav", label_visibility="collapsed")
+        st.divider()
+        db = st.session_state.db
+        prods = db["products"]
+        appr = sum(p["status"] == "Approved" for p in prods)
+        st.caption(f"📦 {len(prods)} records · ✅ {appr} approved")
+        st.caption(f"🧮 Engine {ENGINE_VERSION} · Factors {db['factor_version']}")
+        st.markdown("<span class='eco-warnchip'>SYNTHETIC DEMO DATA</span>", unsafe_allow_html=True)
+        st.caption("Illustrative factors — not for regulatory reporting or certified EPDs.")
+    return choice
 
-    def t7():
-        try:
-            assess(mini, [{"material_code": "steel", "mass_kg": -1, "supplier": "", "quality": "proxy"}], [], P, F)
-            return False, "negative mass was accepted"
-        except ValueError as e:
-            return True, f"ValueError raised: {e}"
+def page_header(title, sub):
+    st.markdown(f"## {title}")
+    st.caption(sub)
 
-    def t8():
-        return "approve" not in PERMS["Analyst"] and "approve" in PERMS["Reviewer"], \
-            "Analyst cannot approve; Reviewer can (server-side rule)"
+# ══════════════════════════════ PAGE: OVERVIEW ══════════════════════════════
+def page_overview():
+    db = st.session_state.db
+    factors = current_factors()
+    prods = active_products()
+    st.markdown(f"""
+<div class="eco-hero">
+  <h1>🌿 Product Lifecycle Environmental Impact Calculator</h1>
+  <p>Bill of materials → manufacturing energy → transport → use phase → end of life.
+     Deterministic engine, seeded Monte Carlo uncertainty, role-based review, full lineage and one-click reports.</p>
+  <span class="eco-chip">Engine {ENGINE_VERSION}</span>
+  <span class="eco-chip">Factors {db['factor_version']}</span>
+  <span class="eco-chip">Schema v{SCHEMA_VERSION}</span>
+  <span class="eco-chip">No API keys · 100% local</span>
+</div>""", unsafe_allow_html=True)
+    if not prods:
+        st.info("No active records. Load the demo portfolio from Governance & QA → Backup & restore → Reset demo, or import a file.")
+        return
+    results, errs = {}, []
+    for p in prods:
+        r, e = safe_results(p, factors)
+        if r: results[p["id"]] = r
+        else: errs.append(f"{p['id']}: {e}")
+    for e in errs:
+        st.warning(e)
+    total = sum(r["total_ghg"] for r in results.values())
+    pmc = cached_portfolio_mc(json.dumps(prods, sort_keys=True), json.dumps(factors, sort_keys=True),
+                              db["settings"]["mc_n"], db["settings"]["mc_seed"])
+    qscore = np.mean([QUALITY_SCORE.get(b["quality"], 0.4) for p in prods for b in p["bom"]] or [0]) * 100
+    unc = (pmc["p95"] - pmc["p5"]) / 2 / max(abs(pmc["p50"]), 1e-9) * 100
+    c = st.columns(5)
+    c[0].metric("Active products", len(prods))
+    c[1].metric("Portfolio footprint", f"{total/1000:,.2f} t CO₂e", help="Deterministic cradle-to-grave total")
+    c[2].metric("Approved", f"{sum(p['status']=='Approved' for p in prods)} / {len(prods)}")
+    c[3].metric("Data quality score", f"{qscore:.0f}%", help="measured=100 · estimated=70 · proxy=40")
+    c[4].metric("Uncertainty (±)", f"{unc:.1f}%", help="Half-width of the P5–P95 interval, relative to P50")
 
-    def t9():
-        r = assess(mini, lines, [], dict(P, eol_recycle=60, incin_share=50), F)
-        eol = r["rows"]
-        mr = eol[eol["item"].str.startswith("Recycling reprocessing")]["qty"].sum()
-        inc = eol[eol["item"].str.startswith("Incineration")]["qty"].sum()
-        land = eol[eol["item"].str.startswith("Landfill")]["qty"].sum()
-        return abs(mr + inc + land - 2.0) < 1e-9, f"mass balance {mr+inc+land:.4f} = 2.0 kg"
+    h1, h2 = st.columns([5, 1])
+    h1.markdown("### 🎲 Live Monte Carlo simulation")
+    if h2.button("▶ Replay", key="replay_conv"):
+        st.session_state.intro_done = False
+        st.rerun()
+    ph = st.empty()
+    totals = pmc["totals"]
+    n = len(totals)
+    checkpoints = sorted({int(x) for x in np.geomspace(25, n, 12)})
+    if not st.session_state.intro_done:
+        xs, ys = [], []
+        for ck in checkpoints:
+            xs.append(ck); ys.append(float(totals[:ck].mean()) / 1000)
+            f = go.Figure(go.Scatter(x=xs, y=ys, mode="lines+markers",
+                                     line=dict(color=LEAF, width=3), marker=dict(size=7, color=FOREST)))
+            fig_layout(f, height=230, title=f"Portfolio estimate converging… {ck:,}/{n:,} draws")
+            f.update_yaxes(title="t CO₂e")
+            ph.plotly_chart(f, key=f"conv{ck}", **_w(st.plotly_chart))
+            time.sleep(0.06)
+        st.session_state.intro_done = True
+    f = go.Figure()
+    xs = checkpoints
+    ys = [float(totals[:ck].mean()) / 1000 for ck in xs]
+    f.add_trace(go.Scatter(x=xs, y=ys, mode="lines+markers", name="Running mean",
+                           line=dict(color=LEAF, width=3), marker=dict(size=6, color=FOREST)))
+    for val, lab, col, dash in [(pmc["p5"]/1000, "P5", TERRA, "dash"), (pmc["p95"]/1000, "P95", TERRA, "dash"),
+                                (pmc["p50"]/1000, "P50", FOREST, "solid")]:
+        f.add_hline(y=val, line_color=col, line_dash=dash, line_width=2,
+                    annotation_text=lab, annotation_position="right")
+    fig_layout(f, height=250, title=f"Converged · seed {db['settings']['mc_seed']} · {n:,} draws · fully reproducible")
+    f.update_yaxes(title="t CO₂e")
+    ph.plotly_chart(f, key="convfinal", **_w(st.plotly_chart))
 
-    for name, fn in [("Hand-check: materials 2 kg steel → 4.92 kg", t1),
-                     ("Hand-check: use phase → 380 kg", t2),
-                     ("Recycling credit is negative", t3),
-                     ("Monte Carlo reproducible with same seed", t4),
-                     ("Malformed import rows rejected (≥6)", t5),
-                     ("Documented template imports cleanly", t6),
-                     ("Negative mass raises ValueError", t7),
-                     ("Authorization: analyst cannot approve", t8),
-                     ("End-of-life mass balance closes", t9)]:
-        check(name, fn)
-    return pd.DataFrame(results)
+    left, right = st.columns([3, 2])
+    with left:
+        f = go.Figure()
+        names = [p["name"] for p in prods if p["id"] in results]
+        for s in STAGES:
+            f.add_trace(go.Bar(name=s, x=names,
+                               y=[results[p["id"]]["stages"][s]["ghg"] for p in prods if p["id"] in results],
+                               marker_color=STAGE_COLORS[s],
+                               hovertemplate="%{x}<br>" + s + ": %{y:,.1f} kg CO₂e<extra></extra>"))
+        f.update_layout(barmode="relative")
+        fig_layout(f, height=380, title="Cradle-to-grave footprint by product & stage")
+        f.update_yaxes(title="kg CO₂e")
+        f.update_xaxes(tickangle=-12)
+        st.plotly_chart(f, key="ov_stack", **_w(st.plotly_chart))
+    with right:
+        stage_tot = {s: sum(r["stages"][s]["ghg"] for r in results.values()) for s in STAGES}
+        pos = {s: v for s, v in stage_tot.items() if v > 0}
+        f = go.Figure(go.Pie(labels=list(pos), values=list(pos.values()), hole=0.62,
+                             marker=dict(colors=[STAGE_COLORS[s] for s in pos]),
+                             textinfo="label+percent"))
+        fig_layout(f, height=380, title="Portfolio stage share (positive contributions)")
+        f.add_annotation(text=f"{total/1000:,.1f}<br>t CO₂e", showarrow=False, font=dict(size=16, color=FOREST))
+        st.plotly_chart(f, key="ov_donut", **_w(st.plotly_chart))
 
+    hot = max(((p, l) for p in prods if p["id"] in results for l in results[p["id"]]["lines"]),
+              key=lambda pl: pl[1]["ghg"], default=None)
+    if hot and total > 0:
+        p, l = hot
+        st.markdown(f"""<div class="eco-callout">🎯 <b>Portfolio hotspot:</b>
+        <b>{l['stage']} · {l['item']}</b> of <b>{html_lib.escape(p['name'])}</b> alone contributes
+        <b>{l['ghg']:,.0f} kg CO₂e</b> ({l['ghg']/max(total,1e-9):.0%} of the portfolio).
+        Open the <b>Scenario Lab</b> to test efficiency, grid-decarbonization and lifetime levers against it.</div>""",
+                    unsafe_allow_html=True)
+    chips = " ".join(f"{pill(s)} <b style='color:{INK}'>{sum(p['status']==s for p in db['products'])}</b>&nbsp;&nbsp;"
+                     for s in STATUSES)
+    st.markdown("**Lifecycle pipeline:** " + chips, unsafe_allow_html=True)
+    q1, q2, q3 = st.columns(3)
+    if q1.button("📥 Import a BOM file", key="go_import"):
+        st.session_state["_nav_pending"] = NAV[4]; st.rerun()
+    if q2.button("✅ Open review queue", key="go_review"):
+        st.session_state["_nav_pending"] = NAV[5]; st.rerun()
+    if q3.button("📄 Generate a report", key="go_report"):
+        st.session_state["_nav_pending"] = NAV[6]; st.rerun()
+    st.markdown("**Recent activity**")
+    st.dataframe(pd.DataFrame(db["audit"][::-1][:6]), hide_index=True, height=220, **_w(st.dataframe))
 
-def page_governance(ctx):
-    strip(ctx)
-    sec("Governance", "Data, factors, audit & reliability",
-        "Versioned reference data with rollback · lineage · audit · backup · observable self-tests.")
-    tabs = st.tabs(["Factor catalog", "Data dictionary", "Audit log", "Data management", "Self-tests", "Architecture & security"])
+# ══════════════════════════════ PAGE: PRODUCTS ══════════════════════════════
+def _clean_editor_rows(df: pd.DataFrame, cols: list) -> list:
+    rows = []
+    for _, r in df.iterrows():
+        if all(pd.isna(r[c]) or str(r[c]).strip() == "" for c in cols):
+            continue
+        rows.append({c: (None if pd.isna(r[c]) else r[c]) for c in cols})
+    return rows
 
-    with tabs[0]:
-        v = ctx["version"]
-        opts = list(FACTOR_VERSIONS)
-        sel = st.selectbox("Active factor version", opts, index=opts.index(v),
-                           format_func=lambda k: f"{k} — {FACTOR_VERSIONS[k]['label']}", key="fv_sel")
-        if st.button("⟳ Apply version (rollback supported)", disabled=not can("factors") or sel == v,
-                     help="Administrator only. Results recompute immediately; change is audited."):
-            with closing(db()) as c, c:
-                c.execute("INSERT OR REPLACE INTO settings VALUES ('factor_version',?)", (sel,))
-                log_event(c, ctx["actor"], ctx["role"], "factors_changed", "reference", sel, f"{v} → {sel}")
-            flash("success", f"Factor set switched {v} → {sel}. All results recomputed.")
+def page_products():
+    db = st.session_state.db
+    factors = current_factors()
+    pend = st.session_state.pop("_view_pending", None)
+    if pend:
+        st.session_state.prod_search = pend["q"]
+        st.session_state.prod_status = pend["status"]
+        st.session_state.prod_cat = pend["cat"]
+        st.session_state.prod_sort = pend["sort"]
+    page_header("📦 Product records", "Create, edit, validate and steer every record through its lifecycle. All mutations are audited.")
+    if db["trash"]:
+        u1, u2 = st.columns([4, 1])
+        u1.info(f"🗑️ {len(db['trash'])} deleted record(s) recoverable (until the next deletion).")
+        if u2.button("↩️ Undo delete", key="undo_del"):
+            st.toast(undo_delete(), icon="↩️"); st.rerun()
+    sel = st.session_state.selected_product
+    if sel and product_by_id(sel):
+        render_product_detail(product_by_id(sel), factors)
+        return
+    st.session_state.selected_product = None
+
+    c1, c2, c3, c4 = st.columns([2, 2, 2, 1.6])
+    c1.text_input("🔎 Search", key="prod_search", placeholder="name, id, category…")
+    c2.multiselect("Status", STATUSES, key="prod_status")
+    cats = sorted({p["category"] for p in db["products"]})
+    c3.multiselect("Category", cats, key="prod_cat")
+    c4.selectbox("Sort", ["Name A–Z", "Footprint ↓", "Footprint ↑", "Updated ↓", "Status"], key="prod_sort")
+    v1, v2, v3, v4 = st.columns([2, 1, 2, 1])
+    view_name = v1.text_input("Save current filters as view", key="view_name", placeholder="e.g. Lighting drafts")
+    if v2.button("💾 Save view", key="save_view") and view_name.strip():
+        db["saved_views"].append({"name": view_name.strip(), "q": st.session_state.prod_search,
+                                  "status": st.session_state.prod_status, "cat": st.session_state.prod_cat,
+                                  "sort": st.session_state.prod_sort})
+        log_event("save_view", "view", view_name.strip()); st.toast("View saved", icon="💾"); st.rerun()
+    view_names = [v["name"] for v in db["saved_views"]]
+    pick = v3.selectbox("Saved views", ["(none)"] + view_names, key="view_pick")
+    if v4.button("📂 Apply", key="apply_view") and pick != "(none)":
+        st.session_state["_view_pending"] = next(v for v in db["saved_views"] if v["name"] == pick)
+        st.rerun()
+
+    q = st.session_state.prod_search.lower().strip()
+    rows = []
+    for p in db["products"]:
+        if q and q not in f"{p['id']} {p['name']} {p['category']}".lower(): continue
+        if st.session_state.prod_status and p["status"] not in st.session_state.prod_status: continue
+        if st.session_state.prod_cat and p["category"] not in st.session_state.prod_cat: continue
+        r, e = safe_results(p, factors)
+        rows.append((p, r["total_ghg"] if r else None, e))
+    sort = st.session_state.prod_sort
+    rows.sort(key=lambda t: {"Name A–Z": lambda: t[0]["name"].lower(),
+                             "Footprint ↓": lambda: -(t[1] if t[1] is not None else -1e18),
+                             "Footprint ↑": lambda: (t[1] if t[1] is not None else 1e18),
+                             "Updated ↓": lambda: "", "Status": lambda: t[0]["status"]}[sort]()
+              if sort != "Updated ↓" else "")
+    if sort == "Updated ↓":
+        rows.sort(key=lambda t: t[0]["updated_utc"], reverse=True)
+    st.caption(f"{len(rows)} record(s) match · click **Open** for the detail drawer")
+    hdr = st.columns([0.4, 1.1, 2.5, 1.4, 1.3, 1.2, 1.0, 0.8])
+    for col, lab in zip(hdr, ["", "ID", "Product", "Category", "Status", "kg CO₂e", "Updated", ""]):
+        col.caption(f"**{lab}**")
+    for p, tot, e in rows:
+        c = st.columns([0.4, 1.1, 2.5, 1.4, 1.3, 1.2, 1.0, 0.8])
+        c[0].checkbox("select", key=f"sel_{p['id']}", label_visibility="collapsed")
+        c[1].markdown(f"`{p['id']}`")
+        c[2].markdown(f"**{html_lib.escape(p['name'])}**")
+        c[3].caption(p["category"])
+        c[4].markdown(pill(p["status"]), unsafe_allow_html=True)
+        c[5].markdown(fmt(tot) if tot is not None else "⚠ data")
+        c[6].caption(p["updated_utc"][:10])
+        if c[7].button("Open", key=f"open_{p['id']}"):
+            st.session_state.selected_product = p["id"]; st.rerun()
+    selected_ids = [p["id"] for p, _, _ in rows if st.session_state.get(f"sel_{p['id']}")]
+    if selected_ids:
+        st.markdown(f"**Bulk actions — {len(selected_ids)} selected**")
+        b1, b2, b3 = st.columns(3)
+        if b1.button("📨 Submit selected (Validated only)", key="bulk_submit", disabled=not can("submit")):
+            ok, skip = 0, 0
+            for pid in selected_ids:
+                p = product_by_id(pid)
+                try:
+                    if p["status"] == "Validated":
+                        transition(p, "In Review", "Bulk submit"); ok += 1
+                    else: skip += 1
+                except (ValueError, PermissionError): skip += 1
+            st.toast(f"Submitted {ok}, skipped {skip}", icon="📨")
+            for k in [k for k in st.session_state if k.startswith("sel_")]: del st.session_state[k]
             st.rerun()
-        mrows = [{"Code": k, "Material": m["name"], "Virgin kg/kg": m["gwp"],
-                  "Recycled kg/kg": m["rec"] if m["rec"] is not None else "n/a",
-                  "±% (95%)": m["unc"], "Recyclable": "yes" if m["recyclable"] else "no",
-                  "Incineration kg/kg": m["incin"], "Landfill kg/kg": m["land"]}
-                 for k, m in ctx["factors"]["materials"].items()]
-        st.markdown(html_table(pd.DataFrame(mrows), num_cols=("Virgin kg/kg", "±% (95%)", "Incineration kg/kg", "Landfill kg/kg")),
-                    unsafe_allow_html=True)
-        prows = [{"Code": k, "Process": p["name"], "Unit": p["unit"], "Factor": p["gwp"], "±% (95%)": p["unc"]}
-                 for k, p in ctx["factors"]["process"].items()]
-        st.markdown(html_table(pd.DataFrame(prows), num_cols=("Factor", "±% (95%)")), unsafe_allow_html=True)
-        st.markdown('<div class="tt-note"><b>License & provenance:</b> these are illustrative synthetic values for software '
-                    'validation only. Before external use, load a licensed database (ecoinvent, GREET, DEFRA, Exiobase), confirm '
-                    'commercial-use and redistribution terms, record update frequency, and have a qualified practitioner review boundaries.</div>',
-                    unsafe_allow_html=True)
+        if b2.button("🗄️ Archive selected (Approved)", key="bulk_archive", disabled=not can("archive")):
+            ok = 0
+            for pid in selected_ids:
+                p = product_by_id(pid)
+                try:
+                    if p["status"] == "Approved":
+                        transition(p, "Archived", "Bulk archive"); ok += 1
+                except (ValueError, PermissionError): pass
+            st.toast(f"Archived {ok}", icon="🗄️")
+            for k in [k for k in st.session_state if k.startswith("sel_")]: del st.session_state[k]
+            st.rerun()
+        if b3.button("🗑️ Delete selected", key="bulk_delete", disabled=not can("delete")):
+            st.toast(delete_products(selected_ids), icon="🗑️")
+            for k in [k for k in st.session_state if k.startswith("sel_")]: del st.session_state[k]
+            st.rerun()
+    with st.expander("➕ New product", expanded=False):
+        with st.form("new_product_form"):
+            n1, n2, n3 = st.columns(3)
+            name = n1.text_input("Name*", "New municipal asset")
+            cat = n2.selectbox("Category", sorted(set(cats) | {"General equipment"}))
+            life = n3.number_input("Lifetime (years)", 0.5, 100.0, 10.0, 0.5)
+            m1, m2, m3, m4 = st.columns(4)
+            mkwh = m1.number_input("Manufacturing kWh", 0.0, 1e7, 10.0, 0.5)
+            mgrid = m2.selectbox("Manufacturing grid", GRID_NAMES)
+            ukwh = m3.number_input("Use kWh / year", 0.0, 1e7, 0.0, 0.5)
+            ugrid = m4.selectbox("Use grid", GRID_NAMES)
+            t1, t2, e1, e2, e3 = st.columns(5)
+            tmode = t1.selectbox("Transport mode", TRANSPORT_NAMES, index=2)
+            tkm = t2.number_input("Distance km", 0.0, 100000.0, 500.0, 10.0)
+            er = e1.number_input("EoL recycle %", 0.0, 100.0, 60.0, 5.0)
+            ei = e2.number_input("EoL incinerate %", 0.0, 100.0, 25.0, 5.0)
+            el = e3.number_input("EoL landfill %", 0.0, 100.0, 15.0, 5.0)
+            go_btn = st.form_submit_button("Create draft record", type="primary", disabled=not can("create"),
+                                           **_w(st.form_submit_button))
+        if go_btn:
+            try:
+                guard("create")
+                if not name.strip():
+                    raise ValueError("Name is required.")
+                now = utcnow()
+                p = {"id": f"P-{uid()[:6]}", "name": name.strip(), "category": cat,
+                     "functional_unit": f"1 unit · {life:g} y service", "status": "Draft",
+                     "schema_version": SCHEMA_VERSION, "created_utc": now, "updated_utc": now,
+                     "lifetime_years": life,
+                     "bom": [{"component": "Main body", "material": "Steel", "mass_kg": 5.0,
+                              "recycled_pct": 30.0, "quality": "estimated"}],
+                     "manufacturing": {"kwh": mkwh, "grid": mgrid, "quality": "estimated"},
+                     "use": {"kwh_per_year": ukwh, "grid": ugrid, "quality": "estimated"},
+                     "transport": [{"mode": tmode, "distance_km": tkm}],
+                     "eol": {"recycle_pct": er, "incinerate_pct": ei, "landfill_pct": el, "quality": "proxy"},
+                     "override": None, "notes": "", "source": {"kind": "manual"}}
+                db["products"].append(p)
+                log_event("create", "product", p["id"], "Manual creation (starter BOM — edit next)")
+                st.session_state.selected_product = p["id"]
+                st.toast(f"Created {p['id']} — edit its BOM", icon="📦"); st.rerun()
+            except (ValueError, PermissionError) as ex:
+                st.error(str(ex))
 
-    with tabs[1]:
-        dd = [
-            ("products", "id", "TEXT PK", "—", "Stable product identifier", "slug+uuid", "internal", "unique"),
-            ("products", "status", "TEXT", "—", "Workflow state", "draft/validated/in_review/approved/changes_requested/archived", "internal", "transition rules"),
-            ("products", "lifetime_yr", "REAL", "years", "Service life", ">0, ≤50", "manual/import", "range check"),
-            ("products", "use_kwh_yr", "REAL", "kWh/yr", "Operating electricity", "≥0, ≤100000", "manual/import", "range check"),
-            ("products", "base_volume", "INTEGER", "units/yr", "Annual program volume", "≥1", "manual", "range check"),
-            ("bom_lines", "material_code", "TEXT FK", "—", "Reference catalog key", "catalog codes", "import/manual", "referential integrity"),
-            ("bom_lines", "mass_kg", "REAL", "kg", "Mass per functional unit", "(0, 5000]", "import/manual", "type+range"),
-            ("bom_lines", "quality", "TEXT", "—", "Data pedigree tag", "measured/supplier/proxy", "import/manual", "enum"),
-            ("bom_lines", "source", "TEXT", "—", "Provenance of the row", "synthetic://, import://, manual://", "system", "required"),
-            ("transport_legs", "mode", "TEXT", "—", "Freight mode", "truck/rail/sea/air", "manual", "enum"),
-            ("transport_legs", "km", "REAL", "km", "Leg distance", "[0, 40000]", "manual", "range check"),
-            ("imports", "sha256", "TEXT", "—", "Checksum of preserved source file", "hex", "system", "required"),
-            ("audit_events", "event", "TEXT", "—", "Material change type", "created/import/approved/override/export/…", "system", "append-only"),
-            ("overrides", "delta_kg", "REAL", "kg CO₂e", "Reviewer adjustment", "[-1000, 1000], reason required", "reviewer", "audited"),
-            ("overrides", "reason", "TEXT", "—", "Justification", "non-empty", "reviewer", "required"),
-            ("scenarios", "params_json", "TEXT", "—", "Frozen parameter snapshot", "valid JSON", "analyst", "schema keys"),
-            ("settings", "factor_version", "TEXT", "—", "Active reference-data version", "known versions", "admin", "audited switch"),
-        ]
-        st.markdown(html_table(pd.DataFrame(dd, columns=["Entity", "Field", "Type", "Unit", "Meaning", "Allowed values", "Source", "Validation"]),
-                               max_h=520), unsafe_allow_html=True)
-        st.caption("All records carry created/updated timestamps, source provenance and schema version. "
-                   "Sensitivity: everything in the demo is synthetic/public; production supplier declarations would be 'confidential'.")
+def render_product_detail(p, factors):
+    db = st.session_state.db
+    locked = record_locked(p)
+    top = st.columns([1, 4, 2])
+    if top[0].button("← All products", key="back_list"):
+        st.session_state.selected_product = None; st.rerun()
+    top[1].markdown(f"### {html_lib.escape(p['name'])}")
+    top[2].markdown(pill(p["status"]) + (
+        " <span class='eco-warnchip'>MANUAL OVERRIDE</span>" if p.get("override") else ""),
+        unsafe_allow_html=True)
+    st.caption(f"`{p['id']}` · {p['category']} · {p['functional_unit']} · source: {p['source'].get('kind','?')}"
+               + (f" ({p['source'].get('file','')})" if p['source'].get('file') else ""))
+    r, e = safe_results(p, factors)
+    if e: st.error(f"Engine: {e}")
+    m = st.columns(4)
+    m[0].metric("Total footprint", f"{fmt(r['total_ghg'])} kg CO₂e" if r else "—")
+    m[1].metric("Per service year", f"{fmt(r['per_year_ghg'])} kg" if r and math.isfinite(r["per_year_ghg"]) else "—")
+    m[2].metric("Product mass", f"{fmt(r['mass_kg'])} kg" if r else "—")
+    m[3].metric("Energy (CED)", f"{fmt0(r['total_mj'])} MJ" if r else "—")
+    issues = validate_product(p)
+    errors = [i for i in issues if i["severity"] == "error"]
+    warns = [i for i in issues if i["severity"] == "warning"]
+    for i in errors: st.error(f"⛔ **{i['field']}** — {i['message']}")
+    for i in warns: st.warning(f"⚠️ **{i['field']}** — {i['message']}")
+    if not issues: st.success("✅ Record passes all validation rules.")
+    if locked and can("edit"):
+        st.info("🔒 Approved/Archived records are locked. An Administrator can reopen them below.")
+    elif not can("edit"):
+        st.info(f"👁️ Read-only for role '{st.session_state.role}'.")
 
-    with tabs[2]:
-        aud = qdf("SELECT * FROM audit_events ORDER BY id DESC")
-        types = sorted(aud["event"].unique().tolist())
-        pick = st.multiselect("Filter event types", types, default=[], key="aud_filter")
-        if pick:
-            aud = aud[aud["event"].isin(pick)]
-        st.markdown(html_table(aud[["ts", "actor", "role", "event", "entity", "entity_id", "details"]].head(200), max_h=480),
-                    unsafe_allow_html=True)
-        st.download_button("⬇ Audit CSV", aud.to_csv(index=False).encode(), "terratrace_audit.csv", "text/csv",
-                           key="aud_dl", disabled=not can("export"), **width_kwargs(st.download_button))
+    tab_def, tab_bom, tab_life = st.tabs(["🧾 Definition", "🧱 Bill of materials & transport", "🔄 Lifecycle & lineage"])
+    with tab_def:
+        with st.form(f"def_form_{p['id']}"):
+            d1, d2, d3 = st.columns(3)
+            name = d1.text_input("Name", p["name"], disabled=locked)
+            cat = d2.text_input("Category", p["category"], disabled=locked)
+            life = d3.number_input("Lifetime (y)", 0.5, 100.0, float(p["lifetime_years"]), 0.5, disabled=locked)
+            fu = st.text_input("Functional unit", p["functional_unit"], disabled=locked)
+            f1, f2, f3, f4 = st.columns(4)
+            mkwh = f1.number_input("Mfg kWh", 0.0, 1e7, float(p["manufacturing"]["kwh"]), 0.5, disabled=locked)
+            mgrid = f2.selectbox("Mfg grid", GRID_NAMES, index=GRID_NAMES.index(p["manufacturing"]["grid"])
+                                 if p["manufacturing"]["grid"] in GRID_NAMES else 0, disabled=locked)
+            ukwh = f3.number_input("Use kWh/y", 0.0, 1e7, float(p["use"]["kwh_per_year"]), 0.5, disabled=locked)
+            ugrid = f4.selectbox("Use grid", GRID_NAMES, index=GRID_NAMES.index(p["use"]["grid"])
+                                 if p["use"]["grid"] in GRID_NAMES else 0, disabled=locked)
+            g1, g2, g3 = st.columns(3)
+            er = g1.number_input("EoL recycle %", 0.0, 100.0, float(p["eol"]["recycle_pct"]), 5.0, disabled=locked)
+            ei = g2.number_input("EoL incinerate %", 0.0, 100.0, float(p["eol"]["incinerate_pct"]), 5.0, disabled=locked)
+            el = g3.number_input("EoL landfill %", 0.0, 100.0, float(p["eol"]["landfill_pct"]), 5.0, disabled=locked)
+            notes = st.text_area("Assumptions & notes", p.get("notes", ""), disabled=locked, height=80)
+            save = st.form_submit_button("💾 Save definition", type="primary", disabled=locked,
+                                         **_w(st.form_submit_button))
+        if save:
+            def mut(q):
+                q.update({"name": name.strip(), "category": cat.strip(), "lifetime_years": life,
+                          "functional_unit": fu.strip(), "notes": notes})
+                q["manufacturing"] = {"kwh": mkwh, "grid": mgrid, "quality": p["manufacturing"]["quality"]}
+                q["use"] = {"kwh_per_year": ukwh, "grid": ugrid, "quality": p["use"]["quality"]}
+                q["eol"] = {"recycle_pct": er, "incinerate_pct": ei, "landfill_pct": el, "quality": p["eol"]["quality"]}
+            try:
+                update_product(p, mut, "Definition edited"); st.toast("Definition saved", icon="💾"); st.rerun()
+            except PermissionError as ex: st.error(str(ex))
+    with tab_bom:
+        st.caption("Add rows with the ➕ below the grid; delete via row selector. Save to apply & revalidate.")
+        bom_df = pd.DataFrame(p["bom"] or [], columns=["component", "material", "mass_kg", "recycled_pct", "quality"])
+        edited = st.data_editor(bom_df, num_rows="dynamic", hide_index=True, key=f"bom_ed_{p['id']}",
+                                disabled=locked, **_w(st.data_editor),
+                                column_config={
+                                    "component": st.column_config.TextColumn("Component", required=True),
+                                    "material": st.column_config.SelectboxColumn("Material", options=MATERIAL_NAMES, required=True),
+                                    "mass_kg": st.column_config.NumberColumn("Mass (kg)", min_value=0.0, max_value=100000.0, step=0.1, format="%.3f"),
+                                    "recycled_pct": st.column_config.NumberColumn("Recycled %", min_value=0.0, max_value=100.0, step=5.0),
+                                    "quality": st.column_config.SelectboxColumn("Data quality", options=list(QUALITY_SIGMA), required=True)})
+        cleaned = _clean_editor_rows(edited, ["component", "material", "mass_kg"])
+        preview_p = copy.deepcopy(p)
+        preview_p["bom"] = [{"component": str(x["component"] or "?"), "material": x["material"],
+                             "mass_kg": _num(x["mass_kg"]), "recycled_pct": _num(x["recycled_pct"]),
+                             "quality": x["quality"] or "proxy"} for x in cleaned]
+        pr, pe = safe_results(preview_p, factors)
+        if pr:
+            st.caption(f"🔴 Live preview (unsaved): **{fmt(pr['total_ghg'])} kg CO₂e** · mass {fmt(pr['mass_kg'])} kg")
+        elif pe:
+            st.caption(f"Live preview unavailable: {pe}")
+        if st.button("💾 Save BOM", key=f"bom_save_{p['id']}", disabled=locked, type="primary"):
+            try:
+                update_product(p, lambda q: q.update({"bom": preview_p["bom"]}),
+                               f"BOM edited → {len(preview_p['bom'])} lines")
+                st.toast("BOM saved & recalculated", icon="🧱"); st.rerun()
+            except PermissionError as ex: st.error(str(ex))
+        r1, r2, r3 = st.columns([2, 1, 1])
+        move_pick = r1.selectbox("Reorder line", [b["component"] for b in p["bom"]] or ["(empty)"],
+                                 key=f"mv_{p['id']}", disabled=locked)
+        for col, delta, lab in [(r2, -1, "↑ Move up"), (r3, 1, "↓ Move down")]:
+            if col.button(lab, key=f"mv{delta}_{p['id']}", disabled=locked):
+                try:
+                    idx = next(i for i, b in enumerate(p["bom"]) if b["component"] == move_pick)
+                    j = idx + delta
+                    if 0 <= j < len(p["bom"]):
+                        def mut(q):
+                            q["bom"][idx], q["bom"][j] = q["bom"][j], q["bom"][idx]
+                        update_product(p, mut, f"Reordered BOM line '{move_pick}'")
+                        st.rerun()
+                    else:
+                        st.toast("Already at the boundary", icon="ℹ️")
+                except (StopIteration, PermissionError) as ex: st.error(str(ex))
+        st.markdown("**Transport legs** (cargo mass auto-derived from BOM)")
+        tr_df = pd.DataFrame(p["transport"] or [], columns=["mode", "distance_km"])
+        tr_ed = st.data_editor(tr_df, num_rows="dynamic", hide_index=True, key=f"tr_ed_{p['id']}",
+                               disabled=locked, **_w(st.data_editor),
+                               column_config={"mode": st.column_config.SelectboxColumn("Mode", options=TRANSPORT_NAMES, required=True),
+                                              "distance_km": st.column_config.NumberColumn("Distance (km)", min_value=0.0, max_value=100000.0, step=10.0)})
+        if st.button("💾 Save transport", key=f"tr_save_{p['id']}", disabled=locked):
+            legs = [{"mode": x["mode"], "distance_km": _num(x["distance_km"])}
+                    for x in _clean_editor_rows(tr_ed, ["mode", "distance_km"])]
+            try:
+                update_product(p, lambda q: q.update({"transport": legs}), f"Transport edited → {len(legs)} legs")
+                st.toast("Transport saved", icon="🚚"); st.rerun()
+            except PermissionError as ex: st.error(str(ex))
+    with tab_life:
+        a = st.columns(5)
+        acts = []
+        if p["status"] in ("Draft", "Changes Requested"): acts.append(("✔️ Validate", "Validated", "submit"))
+        if p["status"] == "Validated": acts.append(("📨 Submit for review", "In Review", "submit"))
+        if p["status"] in ("Approved", "Archived"): acts.append(("🔓 Reopen (admin)", "Draft", "archive"))
+        if p["status"] == "Approved": acts.append(("🗄️ Archive", "Archived", "archive"))
+        for i, (lab, to, perm) in enumerate(acts):
+            if a[i].button(lab, key=f"tr_{p['id']}_{to}", disabled=not can(perm)):
+                try:
+                    transition(p, to); st.toast(f"{p['id']} → {to}", icon="🔄"); st.rerun()
+                except (ValueError, PermissionError) as ex: st.error(str(ex))
+        if p["status"] == "In Review":
+            a[0].info("Awaiting reviewer — decisions in **Review & Approvals**.")
+        if a[3].button("🧬 Duplicate", key=f"dup_{p['id']}", disabled=not can("create")):
+            try:
+                nid = duplicate_product(p); st.session_state.selected_product = nid
+                st.toast(f"Duplicated → {nid}", icon="🧬"); st.rerun()
+            except PermissionError as ex: st.error(str(ex))
+        del_ok = can("delete") and (p["status"] != "Approved" or st.session_state.role == "Administrator")
+        if a[4].button("🗑️ Delete", key=f"del_{p['id']}", disabled=not del_ok):
+            st.toast(delete_products([p["id"]]), icon="🗑️")
+            st.session_state.selected_product = None; st.rerun()
+        st.markdown("**Lineage**")
+        l1, l2 = st.columns(2)
+        l1.json(p["source"], expanded=True)
+        l2.markdown(f"- Engine **{ENGINE_VERSION}**\n- Factors **{db['factor_version']}**\n"
+                    f"- Schema **v{p['schema_version']}**\n- Created `{p['created_utc']}`\n- Updated `{p['updated_utc']}`")
+        if r:
+            st.caption(f"Result digest (reproducibility): `{result_digest(r)}`")
+            st.dataframe(pd.DataFrame(r["lines"])[["stage", "item", "qty", "unit", "factor_id", "factor", "ghg", "quality"]],
+                         hide_index=True, height=260, **_w(st.dataframe))
+        if p.get("override"):
+            st.warning(f"Manual override active: {fmt(p['override']['total_ghg'])} kg CO₂e — "
+                       f"“{p['override']['reason']}” ({p['override']['by']}, {p['override']['ts'][:16]}). Engine value preserved above.")
+        hist = [x for x in db["audit"] if x["entity_id"] == p["id"]]
+        st.markdown("**Record history**")
+        st.dataframe(pd.DataFrame(hist[::-1]), hide_index=True, height=220, **_w(st.dataframe))
 
-    with tabs[3]:
-        g1, g2 = st.columns(2)
-        with g1:
-            st.markdown("#### Backup")
-            st.download_button("⬇ Download database backup (.db)", DB_PATH.read_bytes(),
-                               f"terratrace_backup_{datetime.now(timezone.utc).strftime('%Y%m%d')}.db",
-                               "application/octet-stream", on_click=_log_export, args=("database", "BACKUP"),
-                               key="bk_dl", disabled=not can("export"), **width_kwargs(st.download_button))
-            st.markdown("**Restore (PowerShell):**")
-            st.code("Stop-Process -Name streamlit -ErrorAction SilentlyContinue\n"
-                    "Copy-Item .\\terratrace_backup_YYYYMMDD.db .\\data\\terratrace.db -Force\n"
-                    "streamlit run app.py", language="powershell")
-            st.caption("Retention policy (demo): audit 7 years, preserved uploads 24 months, then purge via scheduled job. "
-                       "Deletion: admin product delete cascades BOM/legs/overrides; audit history is retained.")
-        with g2:
-            st.markdown("#### Preserved source files")
-            files = sorted(UPLOAD_DIR.glob("*"))
-            if files:
-                st.markdown(html_table(pd.DataFrame([{"File": f.name, "Bytes": f.stat().st_size} for f in files]),
-                                       num_cols=("Bytes",)), unsafe_allow_html=True)
-            else:
-                st.caption("No imports committed yet — original files will be stored here with checksum names.")
-            st.markdown("#### Reset demo")
-            conf = st.checkbox("Wipe all records and reseed the synthetic fixtures.", key="reset_conf")
-            if st.button("♻ Reset demo database", disabled=not can("reset") or not conf, key="reset_btn"):
-                with closing(db()) as c, c:
-                    for t in ["bom_lines", "transport_legs", "approvals", "overrides", "scenarios", "imports", "audit_events", "products", "settings"]:
-                        c.execute(f"DELETE FROM {t}")
-                    seed(c)
-                st.session_state["bom_rev"] += 1
-                st.session_state["leg_rev"] += 1
-                st.session_state.pop("report", None)
-                flash("success", "Database reset — synthetic fixtures reloaded. Demo is repeatable from a clean state.")
+# ══════════════════════════════ PAGE: IMPACT ANALYSIS ══════════════════════════════
+def page_analysis():
+    db = st.session_state.db
+    factors = current_factors()
+    prods = active_products()
+    page_header("📊 Impact analysis", "Deterministic breakdown, hotspots, seeded Monte Carlo uncertainty and ±20% sensitivity — every number explainable.")
+    if not prods:
+        st.info("No active products."); return
+    ids = [p["id"] for p in prods]
+    default = st.session_state.get("analysis_pid", ids[0])
+    idx = ids.index(default) if default in ids else 0
+    pid = st.selectbox("Product", ids, index=idx, key="analysis_pick",
+                       format_func=lambda i: f"{i} — {product_by_id(i)['name']}")
+    st.session_state.analysis_pid = pid
+    p = product_by_id(pid)
+    r, e = safe_results(p, factors)
+    if e:
+        st.error(f"Engine cannot compute this record: {e}"); return
+    eff_total = p["override"]["total_ghg"] if p.get("override") else r["total_ghg"]
+    m = st.columns(4)
+    m[0].metric("Total (effective)", f"{fmt(eff_total)} kg CO₂e",
+                help="Manual override active — engine value preserved in lineage" if p.get("override") else "Deterministic engine result")
+    m[1].metric("Per service year", f"{fmt(r['per_year_ghg'])} kg" if math.isfinite(r["per_year_ghg"]) else "—")
+    m[2].metric("Embodied + operational energy", f"{fmt0(r['total_mj'])} MJ")
+    m[3].metric("Result digest", result_digest(r), help="SHA-256 of line items — identical inputs & versions reproduce this exactly")
+    left, right = st.columns(2)
+    with left:
+        vals = [r["stages"][s]["ghg"] for s in STAGES]
+        f = go.Figure(go.Bar(x=STAGES, y=vals, marker_color=[STAGE_COLORS[s] for s in STAGES],
+                             text=[fmt(v) for v in vals], textposition="outside"))
+        fig_layout(f, height=360, title=f"Stage breakdown — net total {fmt(r['total_ghg'])} kg CO₂e")
+        f.update_yaxes(title="kg CO₂e")
+        st.plotly_chart(f, key="an_stages", **_w(st.plotly_chart))
+    with right:
+        top = sorted(r["lines"], key=lambda l: abs(l["ghg"]), reverse=True)[:8][::-1]
+        f = go.Figure(go.Bar(x=[l["ghg"] for l in top],
+                             y=[f"{l['stage']} · {l['item']}" for l in top], orientation="h",
+                             marker_color=[STAGE_COLORS[l["stage"]] for l in top]))
+        fig_layout(f, height=360, title="Top contributors (credits shown negative)")
+        f.update_xaxes(title="kg CO₂e")
+        st.plotly_chart(f, key="an_hot", **_w(st.plotly_chart))
+    gross = sum(max(l["ghg"], 0) for l in r["lines"]) or 1.0
+    hot_df = pd.DataFrame([{**l, "share_%": max(l["ghg"], 0) / gross * 100}
+                           for l in sorted(r["lines"], key=lambda l: abs(l["ghg"]), reverse=True)[:10]])
+    st.markdown("**Hotspot table**")
+    st.dataframe(hot_df[["stage", "item", "qty", "unit", "factor_id", "ghg", "share_%", "quality", "sigma"]],
+                 hide_index=True, **_w(st.dataframe),
+                 column_config={"ghg": st.column_config.NumberColumn("kg CO₂e", format="%.2f"),
+                                "share_%": st.column_config.ProgressColumn("Share of gross", min_value=0, max_value=100, format="%.1f%%")})
+    with st.expander("🔍 Explanation panel — trace any line item"):
+        labels = [f"{l['stage']} · {l['item']} ({fmt(l['ghg'])} kg)" for l in r["lines"]]
+        li = st.selectbox("Line item", range(len(labels)), format_func=lambda i: labels[i], key="an_line")
+        l = r["lines"][li]
+        e1, e2 = st.columns(2)
+        e1.markdown(f"- **Activity:** {l['qty']:g} {l['unit']}\n- **Factor:** `{l['factor_id']}` = {l['factor']:g}"
+                    f"\n- **Factor set:** {db['factor_version']} · **Engine:** {ENGINE_VERSION}"
+                    f"\n- **Quality:** {l['quality']} → σ = {l['sigma']:.2f}")
+        e2.code(l["formula"], language="text")
+        issues = [i for i in validate_product(p) if i["severity"] == "warning"]
+        if issues:
+            for i in issues: st.warning(f"{i['field']}: {i['message']}")
+        st.caption(f"Reviewer status: {p['status']}" + (f" · override by {p['override']['by']}" if p.get("override") else ""))
+    st.markdown("### 🎲 Uncertainty — Monte Carlo (data pedigree × factor uncertainty)")
+    u1, u2, u3 = st.columns([2, 1, 1])
+    n = u1.slider("Draws", 500, 20000, db["settings"]["mc_n"], 500, key="an_n")
+    seed = u2.number_input("Seed", 0, 99999, db["settings"]["mc_seed"], key="an_seed")
+    if u3.button("💾 Save as defaults", key="an_mc_save"):
+        db["settings"] = {"mc_n": int(n), "mc_seed": int(seed)}
+        st.toast("Simulation defaults saved", icon="🎲")
+    mc = cached_mc(json.dumps(p, sort_keys=True), json.dumps(factors, sort_keys=True), int(n), int(seed))
+    s = st.columns(4)
+    s[0].metric("P5", f"{fmt(mc['p5'])} kg")
+    s[1].metric("P50 (median)", f"{fmt(mc['p50'])} kg")
+    s[2].metric("P95", f"{fmt(mc['p95'])} kg")
+    s[3].metric("± interval", f"{(mc['p95']-mc['p5'])/2/max(abs(mc['p50']),1e-9)*100:.1f}%")
+    f = go.Figure(go.Histogram(x=mc["totals"], nbinsx=60, marker_color=LEAF, opacity=0.85))
+    for val, lab, col, dash in [(mc["p5"], "P5", TERRA, "dash"), (mc["p50"], "P50", FOREST, "solid"), (mc["p95"], "P95", TERRA, "dash")]:
+        f.add_vline(x=val, line_color=col, line_dash=dash, line_width=2, annotation_text=lab, annotation_position="top")
+    fig_layout(f, height=330, title=f"Total footprint distribution · seed {int(seed)} · {int(n):,} draws (reproducible)")
+    f.update_xaxes(title="kg CO₂e"); f.update_yaxes(title="draws")
+    st.plotly_chart(f, key="an_hist", **_w(st.plotly_chart))
+    st.markdown("### 🌪️ Sensitivity — ±20% per stage (tornado)")
+    sums = {s_: r["stages"][s_]["ghg"] for s_ in STAGES}
+    order = sorted(STAGES, key=lambda s_: abs(sums[s_]))
+    f = go.Figure()
+    f.add_trace(go.Bar(name="−20%", y=order, x=[-0.2 * sums[s_] for s_ in order], orientation="h", marker_color=SKY))
+    f.add_trace(go.Bar(name="+20%", y=order, x=[0.2 * sums[s_] for s_ in order], orientation="h", marker_color=AMBER))
+    f.update_layout(barmode="relative")
+    fig_layout(f, height=300, title="Change in total kg CO₂e (model is linear in each stage)")
+    f.update_xaxes(title="Δ kg CO₂e", zeroline=True, zerolinecolor=INK)
+    st.plotly_chart(f, key="an_tornado", **_w(st.plotly_chart))
+
+# ══════════════════════════════ PAGE: SCENARIO LAB ══════════════════════════════
+def page_scenarios():
+    db = st.session_state.db
+    factors = current_factors()
+    prods = active_products()
+    page_header("🔀 Scenario lab", "Eight live levers against the baseline — every slider recalculates instantly. Save, compare and export scenarios.")
+    if not prods:
+        st.info("No active products."); return
+    pend = st.session_state.pop("_scen_pending", None)
+    if pend:
+        for k, v in pend.items():
+            st.session_state[k] = v
+    ids = [p["id"] for p in prods]
+    pid = st.selectbox("Product", ids, key="sc_pid_pick",
+                       format_func=lambda i: f"{i} — {product_by_id(i)['name']}")
+    p = product_by_id(pid)
+    base_r, e = safe_results(p, factors)
+    if e:
+        st.error(e); return
+    d = scenario_defaults(p)
+    ctl, out = st.columns([1, 2])
+    with ctl:
+        st.markdown("#### 🎛️ Live controls")
+        s = {}
+        s["recycled_boost"] = st.slider("Recycled content boost (+pp)", 0, 100, d["recycled_boost"], 5, key="sc_boost")
+        s["use_eff"] = st.slider("Use-phase efficiency gain (%)", 0, 60, d["use_eff"], 5, key="sc_eff")
+        s["lifetime_mult"] = st.slider("Lifetime multiplier (×)", 0.5, 2.0, d["lifetime_mult"], 0.1, key="sc_life")
+        s["transport_cut"] = st.slider("Transport distance cut (%)", 0, 90, d["transport_cut"], 5, key="sc_cut")
+        s["sea_to_rail"] = st.toggle("Shift sea freight → rail", d["sea_to_rail"], key="sc_rail")
+        s["use_grid_mult"] = st.slider("Use-grid carbon intensity (×)", 0.05, 1.0, d["use_grid_mult"], 0.05, key="sc_grid")
+        s["mfg_grid"] = st.selectbox("Manufacturing grid", GRID_NAMES,
+                                     index=GRID_NAMES.index(d["mfg_grid"]) if d["mfg_grid"] in GRID_NAMES else 0, key="sc_mfg")
+        s["eol_target"] = st.slider("EoL recycling target (%)", 0, 95, min(95, d["eol_target"]), 5, key="sc_eol")
+        b1, b2 = st.columns(2)
+        if b1.button("↺ Reset levers", key="sc_reset"):
+            st.session_state["_scen_pending"] = {"sc_boost": d["recycled_boost"], "sc_eff": d["use_eff"],
+                "sc_life": d["lifetime_mult"], "sc_cut": d["transport_cut"], "sc_rail": d["sea_to_rail"],
+                "sc_grid": d["use_grid_mult"], "sc_mfg": d["mfg_grid"], "sc_eol": min(95, d["eol_target"])}
+            st.rerun()
+        if b2.button("🎲 Randomize", key="sc_rand"):
+            st.session_state["_scen_pending"] = {"sc_boost": random.randrange(0, 65, 5),
+                "sc_eff": random.randrange(0, 55, 5), "sc_life": round(random.uniform(0.8, 1.6), 1),
+                "sc_cut": random.randrange(0, 75, 5), "sc_rail": random.choice([True, False]),
+                "sc_grid": round(random.uniform(0.1, 1.0), 2), "sc_mfg": random.choice(GRID_NAMES),
+                "sc_eol": random.randrange(50, 96, 5)}
+            st.rerun()
+        name = st.text_input("Scenario name", f"{p['name']} — improvement", key="sc_name")
+        if st.button("💾 Save scenario", key="sc_save", type="primary", **_w(st.button)):
+            _, sr = apply_scenario(p, s, factors)
+            db["scenarios"].append({"id": uid(), "name": name.strip() or "Untitled", "pid": pid,
+                                    "params": s, "delta_ghg": sr["total_ghg"] - base_r["total_ghg"],
+                                    "created": utcnow(), "by": current_user()})
+            log_event("save_scenario", "scenario", name, f"Δ {sr['total_ghg']-base_r['total_ghg']:,.1f} kg CO₂e")
+            st.toast("Scenario saved", icon="💾"); st.rerun()
+    q, sr = apply_scenario(p, s, factors)
+    with out:
+        delta = sr["total_ghg"] - base_r["total_ghg"]
+        pct = delta / max(abs(base_r["total_ghg"]), 1e-9) * 100
+        m = st.columns(3)
+        m[0].metric("Baseline", f"{fmt(base_r['total_ghg'])} kg CO₂e")
+        m[1].metric("Scenario", f"{fmt(sr['total_ghg'])} kg CO₂e", f"{delta:+,.1f} kg", delta_color="inverse")
+        m[2].metric("Change", f"{pct:+.1f}%", help="Negative = improvement (green)")
+        f = go.Figure()
+        for stg in STAGES:
+            f.add_trace(go.Bar(name=stg, x=["Baseline", "Scenario"],
+                               y=[base_r["stages"][stg]["ghg"], sr["stages"][stg]["ghg"]],
+                               marker_color=STAGE_COLORS[stg]))
+        f.update_layout(barmode="relative")
+        fig_layout(f, height=380, title="Baseline vs scenario — stage by stage")
+        f.update_yaxes(title="kg CO₂e")
+        st.plotly_chart(f, key="sc_compare", **_w(st.plotly_chart))
+        cmp_df = pd.DataFrame([{"stage": stg, "baseline_kg": base_r["stages"][stg]["ghg"],
+                                "scenario_kg": sr["stages"][stg]["ghg"],
+                                "delta_kg": sr["stages"][stg]["ghg"] - base_r["stages"][stg]["ghg"]} for stg in STAGES])
+        st.dataframe(cmp_df, hide_index=True, **_w(st.dataframe))
+        st.download_button("⬇️ Export scenario comparison (CSV)", cmp_df.to_csv(index=False),
+                           file_name=f"scenario_{pid}.csv", mime="text/csv", key="sc_export")
+    saved = [x for x in db["scenarios"] if x["pid"] == pid]
+    if saved:
+        st.markdown("#### 📚 Saved scenarios for this product")
+        totals = [("Baseline", base_r["total_ghg"])]
+        for x in saved:
+            try:
+                _, xr = apply_scenario(p, x["params"], factors)
+                totals.append((x["name"], xr["total_ghg"]))
+            except (ValueError, KeyError):
+                continue
+        f = go.Figure(go.Bar(x=[t[0] for t in totals], y=[t[1] for t in totals],
+                             marker_color=SERIES[:len(totals)], text=[fmt(t[1]) for t in totals], textposition="outside"))
+        fig_layout(f, height=320, title="Saved scenario comparison (recomputed with current factor set)")
+        f.update_yaxes(title="kg CO₂e"); f.update_xaxes(tickangle=-10)
+        st.plotly_chart(f, key="sc_saved_chart", **_w(st.plotly_chart))
+        for x in saved:
+            c = st.columns([4, 2, 1, 1])
+            c[0].markdown(f"**{html_lib.escape(x['name'])}** — Δ {x['delta_ghg']:+,.1f} kg · {x['by']} · {x['created'][:16]}")
+            c[1].caption(" · ".join(f"{k}={v}" for k, v in list(x["params"].items())[:4]) + " …")
+            if c[2].button("Load", key=f"sc_load_{x['id']}"):
+                st.session_state["_scen_pending"] = {"sc_boost": x["params"]["recycled_boost"],
+                    "sc_eff": x["params"]["use_eff"], "sc_life": x["params"]["lifetime_mult"],
+                    "sc_cut": x["params"]["transport_cut"], "sc_rail": x["params"]["sea_to_rail"],
+                    "sc_grid": x["params"]["use_grid_mult"], "sc_mfg": x["params"]["mfg_grid"],
+                    "sc_eol": x["params"]["eol_target"]}
                 st.rerun()
-        st.markdown("#### PostgreSQL migration path (team edition)")
-        st.markdown("- Swap the connection layer for SQLAlchemy + Alembic; schema is already normalized and versioned.\n"
-                    "- Types map 1:1 (TEXT→TEXT, REAL→DOUBLE PRECISION, AUTOINCREMENT→IDENTITY).\n"
-                    "- Bulk-move with `pgloader data/terratrace.db postgresql://…`, then enable row-level auth, "
-                    "server-side sessions and concurrent transaction tests before multi-user rollout.")
+            if c[3].button("Delete", key=f"sc_del_{x['id']}"):
+                db["scenarios"].remove(x)
+                log_event("delete_scenario", "scenario", x["name"]); st.rerun()
 
-    with tabs[4]:
-        st.markdown("#### Observable acceptance self-tests")
-        st.caption("Hand-checkable arithmetic, validation, reproducibility, authorization and mass-balance invariants. "
-                   "Run them any time — results are real, computed live, and logged.")
-        if st.button("▶ Run self-tests", type="primary", key="st_run"):
-            st.session_state["selftests"] = run_self_tests()
-            with closing(db()) as c, c:
-                n_fail = int((st.session_state["selftests"]["Result"] == "FAIL").sum())
-                log_event(c, ctx["actor"], ctx["role"], "selftest", "engine", ENGINE_VERSION,
-                          f'{len(st.session_state["selftests"])} tests, {n_fail} failures')
-        if "selftests" in st.session_state:
-            t = st.session_state["selftests"]
-            n_pass = int((t["Result"] == "PASS").sum())
-            if n_pass == len(t):
-                st.success(f"All {len(t)} acceptance checks passed.")
+# ══════════════════════════════ PAGE: IMPORT & VALIDATE ══════════════════════════════
+def page_import():
+    db = st.session_state.db
+    factors = current_factors()
+    page_header("📥 Import & validate", "CSV / XLSX BOM import with preview, row-level actionable errors, downloadable error report and a safe, never-overwriting commit.")
+    left, right = st.columns([1, 2])
+    with left:
+        st.markdown("**1 · Get a template**")
+        st.download_button("⬇️ Valid sample CSV (2 new products)", VALID_SAMPLE, "sample_valid.csv", "text/csv", key="dl_valid")
+        st.download_button("⬇️ Malformed sample CSV (demo of rejections)", BROKEN_SAMPLE, "sample_broken.csv", "text/csv", key="dl_broken")
+        st.markdown("**2 · Load a file**")
+        up = st.file_uploader("Upload CSV or XLSX", type=["csv", "xlsx"], key="imp_up",
+                              disabled=not can("create"))
+        if st.button("🧪 Try built-in valid sample", key="try_valid", **_w(st.button)):
+            st.session_state.import_payload = {"name": "sample_valid.csv", "bytes": VALID_SAMPLE.encode(), "fmt": "csv"}
+            st.rerun()
+        if st.button("🧪 Try built-in broken sample", key="try_broken", **_w(st.button)):
+            st.session_state.import_payload = {"name": "sample_broken.csv", "bytes": BROKEN_SAMPLE.encode(), "fmt": "csv"}
+            st.rerun()
+        st.caption("One row per BOM component; product-level columns repeat and must be consistent. "
+                   "Existing product IDs are rejected — validated source data is never silently overwritten. "
+                   "Original files are preserved with a SHA-256 checksum.")
+        with st.expander("📖 Column contract"):
+            st.code(", ".join(IMPORT_COLS), language="text")
+    payload = None
+    if up is not None:
+        payload = {"name": up.name, "bytes": up.getvalue(), "fmt": "xlsx" if up.name.lower().endswith("xlsx") else "csv"}
+    elif st.session_state.import_payload:
+        payload = st.session_state.import_payload
+    with right:
+        st.markdown("**3 · Preview & validate**")
+        if payload is None:
+            st.info("Upload a file or click a built-in sample — the validation preview appears here instantly.")
+        else:
+            raw = payload["bytes"]
+            sha = hashlib.sha256(raw).hexdigest()
+            try:
+                if payload["fmt"] == "xlsx":
+                    df = pd.read_excel(io.BytesIO(raw))
+                    raw_text = base64.b64encode(raw).decode()
+                else:
+                    raw_text = raw.decode("utf-8-sig", "replace")
+                    df = pd.read_csv(io.StringIO(raw_text))
+            except ImportError:
+                st.error("XLSX needs openpyxl — it is included in requirements.txt. Re-run pip install."); return
+            except Exception as ex:
+                st.error(f"Could not parse file: {ex}"); return
+            st.caption(f"📄 **{payload['name']}** · {len(df)} rows · sha256 `{sha[:16]}…`")
+            res = parse_import(df, {p["id"] for p in db["products"]}, factors)
+            if res["missing_cols"]:
+                st.error(f"Missing required columns: {', '.join(res['missing_cols'])} — download the template above.")
+                return
+            m = st.columns(3)
+            m[0].metric("Rows", res["n_rows"])
+            m[1].metric("Valid products", len(res["valid_products"]))
+            m[2].metric("Rejected groups", len(res["rejected_groups"]))
+            def row_style(row):
+                bg = "background-color:#FDECEA" if str(row["import_status"]).startswith("❌") else "background-color:#EAF6EE"
+                return [bg] * len(row)
+            st.dataframe(res["preview"].style.apply(row_style, axis=1).hide(axis="index"),
+                         height=300, **_w(st.dataframe))
+            err_rows = res["preview"][res["preview"]["errors"] != ""]
+            if len(err_rows):
+                rep = pd.DataFrame({"file_row": err_rows.index + 2,
+                                    "product_id": err_rows["product_id"],
+                                    "component": err_rows["component"],
+                                    "errors": err_rows["errors"]})
+                st.download_button("⬇️ Download row-level error report (CSV)", rep.to_csv(index=False),
+                                   file_name=f"import_errors_{payload['name']}.csv", mime="text/csv", key="dl_err")
+                for pid, msgs in res["rejected_groups"].items():
+                    st.error(f"**{pid}** rejected: " + " · ".join(msgs[:4]) + (" …" if len(msgs) > 4 else ""))
+            if res["valid_products"]:
+                st.success(f"✅ Ready to import: {', '.join(p['id'] for p in res['valid_products'])} (as Draft records)")
+            if st.button(f"📥 Import {len(res['valid_products'])} valid product(s)", type="primary",
+                         key="imp_commit", disabled=not (can("create") and res["valid_products"]),
+                         **_w(st.button)):
+                try:
+                    guard("create")
+                    existing = {p["id"] for p in db["products"]}
+                    bid = f"B-{uid()[:6]}"
+                    committed = 0
+                    for p in res["valid_products"]:
+                        if p["id"] in existing:
+                            continue
+                        p["source"] = {"kind": "import", "file": payload["name"], "sha256": sha, "batch_id": bid}
+                        db["products"].append(p)
+                        log_event("import", "product", p["id"], f"Batch {bid} · {payload['name']}")
+                        committed += 1
+                    db["imports"].append({"id": bid, "file": payload["name"], "sha256": sha, "ts": utcnow(),
+                                          "actor": current_user(), "rows": res["n_rows"], "imported": committed,
+                                          "rejected": len(res["rejected_groups"]), "format": payload["fmt"],
+                                          "raw_text": raw_text})
+                    st.toast(f"Imported {committed} product(s) — originals preserved in batch {bid}", icon="📥")
+                    st.session_state.import_payload = None
+                    st.rerun()
+                except PermissionError as ex:
+                    st.error(str(ex))
+    st.markdown("#### 🧾 Import history (source files preserved with checksums)")
+    hist = pd.DataFrame([{k: v for k, v in b.items() if k != "raw_text"} for b in db["imports"]][::-1])
+    st.dataframe(hist, hide_index=True, **_w(st.dataframe))
+
+# ══════════════════════════════ PAGE: REVIEW & APPROVALS ══════════════════════════════
+def page_review():
+    db = st.session_state.db
+    factors = current_factors()
+    page_header("✅ Review & approvals", "Reviewer decisions with mandatory notes on change requests, blocked approvals on validation errors, and audited manual overrides.")
+    queue = [p for p in db["products"] if p["status"] == "In Review"]
+    if not queue:
+        st.success("🎉 Review queue is clear. Submit validated records from the Products page.")
+    else:
+        pid = st.selectbox("Queue item", [p["id"] for p in queue], key="rev_pick",
+                           format_func=lambda i: f"{i} — {product_by_id(i)['name']}")
+        p = product_by_id(pid)
+        r, e = safe_results(p, factors)
+        issues = validate_product(p)
+        errors = [i for i in issues if i["severity"] == "error"]
+        m = st.columns(3)
+        m[0].metric("Engine total", f"{fmt(r['total_ghg'])} kg CO₂e" if r else "—")
+        m[1].metric("Validation errors", len(errors))
+        m[2].metric("Warnings", len(issues) - len(errors))
+        for i in issues:
+            (st.error if i["severity"] == "error" else st.warning)(f"**{i['field']}** — {i['message']}")
+        if e: st.error(e)
+        if r:
+            with st.expander("Line items under review", expanded=False):
+                st.dataframe(pd.DataFrame(r["lines"])[["stage", "item", "qty", "unit", "factor_id", "ghg", "quality"]],
+                             hide_index=True, **_w(st.dataframe))
+        note = st.text_area("Reviewer note (required for change requests)", key=f"rev_note_{pid}",
+                            placeholder="Evidence checked, assumptions accepted because…")
+        c1, c2 = st.columns(2)
+        if c1.button("✅ Approve", type="primary", key=f"rev_ok_{pid}",
+                     disabled=not can("approve") or bool(errors), **_w(st.button)):
+            try:
+                transition(p, "Approved", note); st.toast(f"{pid} approved", icon="✅"); st.rerun()
+            except (ValueError, PermissionError) as ex: st.error(str(ex))
+        if c2.button("↩️ Request changes", key=f"rev_no_{pid}", disabled=not can("approve"), **_w(st.button)):
+            try:
+                transition(p, "Changes Requested", note); st.toast("Changes requested", icon="↩️"); st.rerun()
+            except (ValueError, PermissionError) as ex: st.error(str(ex))
+        if not can("approve"):
+            st.info(f"Role '{st.session_state.role}' can view but not decide. Switch to Reviewer or Administrator.")
+    st.markdown("#### ✍️ Manual override (engine value always preserved)")
+    over_candidates = [p for p in db["products"] if p["status"] in ("In Review", "Approved")]
+    if over_candidates:
+        opid = st.selectbox("Record", [p["id"] for p in over_candidates], key="ov_pick",
+                            format_func=lambda i: f"{i} — {product_by_id(i)['name']}")
+        op = product_by_id(opid)
+        orr, _ = safe_results(op, factors)
+        o1, o2, o3 = st.columns([1, 2, 1])
+        new_total = o1.number_input("Override total (kg CO₂e)", 0.0, 1e9,
+                                    float(op["override"]["total_ghg"] if op.get("override") else (orr["total_ghg"] if orr else 0.0)),
+                                    1.0, key="ov_val", disabled=not can("override"))
+        reason = o2.text_input("Reason (required, audited)", key="ov_reason",
+                               value=op["override"]["reason"] if op.get("override") else "",
+                               disabled=not can("override"))
+        if o3.button("Apply override", key="ov_apply", disabled=not can("override")):
+            if not reason.strip():
+                st.warning("A reason is required for a manual override.")
             else:
-                st.error(f"{len(t) - n_pass} of {len(t)} checks failed — investigate before release.")
-            tt = t.copy()
-            tt["Result"] = tt["Result"].map({"PASS": "ok", "FAIL": "error"})
-            st.markdown(html_table(tt, badge_col="Result", max_h=420), unsafe_allow_html=True)
+                op["override"] = {"total_ghg": float(new_total), "reason": reason.strip(),
+                                  "by": current_user(), "ts": utcnow()}
+                op["updated_utc"] = utcnow()
+                log_event("override", "product", opid,
+                          f"{fmt(new_total)} kg — {reason.strip()} (engine {fmt(orr['total_ghg']) if orr else '?'} preserved)")
+                st.toast("Override applied & audited", icon="✍️"); st.rerun()
+        if op.get("override") and can("override"):
+            if st.button("🧹 Clear override", key="ov_clear"):
+                log_event("clear_override", "product", opid, f"Removed override of {fmt(op['override']['total_ghg'])} kg")
+                op["override"] = None; st.toast("Override cleared", icon="🧹"); st.rerun()
+    st.markdown("#### 🏛️ Approved register")
+    approved = [p for p in db["products"] if p["status"] == "Approved"]
+    if approved:
+        st.dataframe(pd.DataFrame([{"id": p["id"], "name": p["name"],
+                                    "approver": p.get("review", {}).get("by", "—"),
+                                    "note": p.get("review", {}).get("note", ""),
+                                    "approved_utc": p.get("review", {}).get("ts", p["updated_utc"])} for p in approved]),
+                     hide_index=True, **_w(st.dataframe))
+    with st.expander("🔐 Access-control matrix (enforced in handlers)"):
+        actions = ["view", "edit", "create", "delete", "submit", "approve", "override", "archive", "export", "factors", "restore", "reset"]
+        st.dataframe(pd.DataFrame([{"action": a, **{r: ("✅" if role_can(r, a) or (a == "export" and role_can(r, "export_approved")) else "—")
+                                                   for r in USERS}} for a in actions]),
+                     hide_index=True, **_w(st.dataframe))
+        st.caption("Stakeholders may export **approved** reports only.")
 
-    with tabs[5]:
-        erd = ('digraph ERD { rankdir=LR; bgcolor="transparent"; '
-               'node [shape=record, style="filled", fillcolor="#FFFDF8", fontcolor="#16281F", color="#C7BBA0", fontname="Inter", fontsize=10]; '
-               'edge [color="#7A8B7E", fontname="Inter", fontsize=9, fontcolor="#5C6F63"]; '
-               'products [label="{products|id · name · status\\llifetime · energy · volume\\lsource · schema_version\\l}"]; '
-               'bom [label="{bom_lines|product_id · material_code\\lmass_kg · quality · source\\l}"]; '
-               'legs [label="{transport_legs|product_id · scope\\lmode · km\\l}"]; '
-               'appr [label="{approvals|product_id · from→to\\lactor · role · comment\\l}"]; '
-               'ovr [label="{overrides|product_id · stage\\ldelta_kg · reason · active\\l}"]; '
-               'imp [label="{imports|filename · sha256\\lrows ok/err · actor\\l}"]; '
-               'aud [label="{audit_events|ts · actor · event\\lentity · details\\l}"]; '
-               'scn [label="{scenarios|name · params_json\\lactor · created_at\\l}"]; '
-               'set [label="{settings|factor_version\\l}"]; '
-               'products->bom [label="1:N"]; products->legs [label="1:N"]; products->appr [label="1:N"]; '
-               'products->ovr [label="1:N"]; products->imp [label="1:N"]; }')
-        st.graphviz_chart(erd, **width_kwargs(st.graphviz_chart))
-        roles_df = pd.DataFrame([{"Action": a, **{r: ("✔" if a in PERMS[r] else "—") for r in ROLES}} for a in sorted(ALL_ACTIONS)])
-        st.markdown(html_table(roles_df, max_h=380), unsafe_allow_html=True)
-        st.markdown(
-            "**Threat model & honest boundaries**\n"
-            "- *Demo auth:* role switching is a client-side simulation. Production requires server-side authentication "
-            "(e.g. FastAPI + argon2 password hashing), HTTPS and secrets in environment variables.\n"
-            "- *Tampering:* imports are checksummed and preserved; every material change, approval, override and export is audited.\n"
-            "- *Injection:* all SQL is parameterized; uploads are type-, size- (5 MB) and schema-validated.\n"
-            "- *Disclosure:* demo data is synthetic; production supplier declarations must be classified confidential and access-scoped.\n"
-            "- *Reliability:* short-lived transactions, deterministic seeded engine, backup/restore above, pinned dependency list, "
-            "structured audit log. Multi-user concurrency and rate limiting arrive with the PostgreSQL team edition.\n\n"
-            "**Release tiers:** (1) Local MVP — this app, one operator, free demo. (2) Team — shared PostgreSQL, real roles/approvals, "
-            "per-seat pricing hypothesis. (3) Enterprise — SSO, audit exports, deployment controls, SLAs. "
-            "No compliance or certification is claimed; qualified domain review is required for regulated use.")
+# ══════════════════════════════ PAGE: REPORTS & EXPORT ══════════════════════════════
+REPORT_CSS = """<style>
+body{font-family:'Segoe UI',Inter,sans-serif;color:#14231C;margin:0;background:#F6F5EF}
+.wrap{max-width:860px;margin:0 auto;padding:28px}
+.hero{background:linear-gradient(120deg,#0B3B2E,#1E7A55 70%,#4C9A44);color:#fff;border-radius:14px;padding:22px 26px}
+.hero h1{margin:0 0 4px;font-size:22px}.hero p{margin:0;color:#CFE8D2;font-size:13px}
+.meta{display:flex;flex-wrap:wrap;gap:8px;margin:14px 0}
+.chip{background:#fff;border:1px solid #D8E6CF;border-radius:999px;padding:4px 12px;font-size:12px;font-weight:600}
+.kpis{display:flex;gap:12px;margin:14px 0;flex-wrap:wrap}
+.kpi{flex:1;min-width:150px;background:#fff;border-left:5px solid #2E7D5B;border-radius:10px;padding:12px 14px;border-top:1px solid #E1E8DD;border-right:1px solid #E1E8DD;border-bottom:1px solid #E1E8DD}
+.kpi b{display:block;font-size:20px;color:#0E3B2E}.kpi span{font-size:12px;color:#4A5A50}
+h2{color:#0E3B2E;font-size:16px;margin:22px 0 8px;border-bottom:2px solid #A8E10C;padding-bottom:4px}
+table{border-collapse:collapse;width:100%;background:#fff;font-size:12px}
+th{background:#0E3B2E;color:#fff;padding:6px 8px;text-align:left}
+td{border-bottom:1px solid #E1E8DD;padding:5px 8px}
+.warn{background:#FFF3CD;border:1px solid #F2A007;border-radius:10px;padding:10px 14px;font-size:12px;margin:10px 0}
+.draft{background:#FDECEA;border:2px solid #E4572E;color:#8C2B0E;border-radius:10px;padding:10px 14px;font-weight:700;margin:10px 0}
+.foot{font-size:11px;color:#5C665F;margin-top:22px;border-top:1px solid #D8E6CF;padding-top:10px}
+code{background:#EDF2EA;padding:1px 5px;border-radius:4px}
+</style>"""
 
+def html_report(p, r, issues, mc, fv, audit_rows) -> str:
+    esc = html_lib.escape
+    eff = p["override"]["total_ghg"] if p.get("override") else r["total_ghg"]
+    stages_df = pd.DataFrame([{"Stage": s, "kg CO2e": round(r["stages"][s]["ghg"], 2),
+                               "MJ": round(r["stages"][s]["mj"], 1)} for s in STAGES])
+    hot_df = pd.DataFrame([{"Stage": l["stage"], "Item": l["item"], "kg CO2e": round(l["ghg"], 2),
+                            "Factor": l["factor_id"], "Quality": l["quality"]}
+                           for l in sorted(r["lines"], key=lambda x: abs(x["ghg"]), reverse=True)[:6]])
+    aud_df = pd.DataFrame(audit_rows)[["ts", "actor", "action", "details"]] if audit_rows else pd.DataFrame()
+    warn_html = "".join(f"<div class='warn'>⚠️ <b>{esc(i['field'])}</b>: {esc(i['message'])}</div>"
+                        for i in issues) or "<p>✅ No validation issues.</p>"
+    draft_html = "" if p["status"] == "Approved" else "<div class='draft'>DRAFT — NOT APPROVED · decision support only</div>"
+    ov_html = (f"<div class='warn'>✍️ Manual override: <b>{eff:,.1f} kg</b> — “{esc(p['override']['reason'])}” "
+               f"by {esc(p['override']['by'])}. Engine value {r['total_ghg']:,.1f} kg preserved.</div>"
+               if p.get("override") else "")
+    review = p.get("review", {})
+    return REPORT_CSS + f"""<div class="wrap">
+<div class="hero"><h1>🌿 Lifecycle Impact Report — {esc(p['name'])}</h1>
+<p>{esc(p['functional_unit'])} · cradle-to-grave · attributional</p></div>
+{draft_html}
+<div class="meta"><span class="chip">ID {esc(p['id'])}</span><span class="chip">Status {esc(p['status'])}</span>
+<span class="chip">Engine {ENGINE_VERSION}</span><span class="chip">Factors {esc(fv)}</span>
+<span class="chip">Digest {result_digest(r)}</span><span class="chip">Generated {utcnow()}</span></div>
+<div class="kpis">
+<div class="kpi"><span>Total (effective)</span><b>{eff:,.1f} kg CO₂e</b></div>
+<div class="kpi"><span>Per service year</span><b>{r['per_year_ghg']:,.1f} kg</b></div>
+<div class="kpi"><span>Energy (CED)</span><b>{r['total_mj']:,.0f} MJ</b></div>
+<div class="kpi"><span>Uncertainty P5–P95</span><b>{mc['p5']:,.0f} – {mc['p95']:,.0f} kg</b></div></div>
+{ov_html}
+<h2>Stage breakdown</h2>{stages_df.to_html(index=False, border=0)}
+<h2>Top contributors</h2>{hot_df.to_html(index=False, border=0)}
+<h2>Uncertainty</h2><p>Monte Carlo, {len(mc['totals']):,} draws, seed-fixed pedigree model
+(σ: measured 5% · estimated 15% · proxy 30%, combined with 10% factor uncertainty).
+P5 <b>{mc['p5']:,.1f}</b> · P50 <b>{mc['p50']:,.1f}</b> · P95 <b>{mc['p95']:,.1f}</b> kg CO₂e.</p>
+<h2>Data quality & validation</h2>{warn_html}
+<h2>Boundaries & assumptions</h2><ul>
+<li>Materials: mass × blended virgin/recycled factor. Manufacturing & use: kWh × regional grid factor.</li>
+<li>Transport: BOM mass (t) × distance × mode factor. EoL: recycling credit (90% recovery) + incineration + landfill.</li>
+<li>Capital goods, refrigerant leakage and infrastructure excluded. Notes: {esc(p.get('notes','') or '—')}</li></ul>
+<h2>Review & approval</h2><p>Status <b>{esc(p['status'])}</b> · Reviewer: {esc(review.get('by','—'))}
+· Note: {esc(review.get('note','—'))} · {esc(review.get('ts','—'))}</p>
+<h2>Lineage & audit trail (latest)</h2>
+<p>Source: <code>{esc(json.dumps(p['source']))}</code></p>{aud_df.to_html(index=False, border=0) if len(aud_df) else ''}
+<div class="foot">SYNTHETIC DEMO DATA with illustrative factors ({esc(fv)}). This report is decision support,
+not a certified LCA, EPD or regulatory compliance claim. Qualified practitioner review and licensed
+reference data are required before external use. © EcoLedger LCA demo.</div></div>"""
 
-# ============================================================================
-# MAIN
-# ============================================================================
-def main():
-    st.set_page_config(page_title="TerraTrace — Lifecycle Impact Studio", page_icon="🌿", layout="wide")
-    st.markdown(f"<style>{CSS}</style>", unsafe_allow_html=True)
-    try:
-        init_db()
-    except sqlite3.Error as e:
-        st.error(f"Database initialization failed: {e}")
-        st.stop()
-    products = qdf("SELECT * FROM products ORDER BY created_at").to_dict("records")
-    if not products:
-        with closing(db()) as c, c:
-            seed(c)
-        products = qdf("SELECT * FROM products ORDER BY created_at").to_dict("records")
-    ensure_defaults(products)
-    version = get_setting("factor_version", "FCT-2026.1")
-    factors = resolve_factors(version)
-    pid, role, actor_name = build_sidebar(products, version)
-    actor = actor_name.strip() or "Anonymous"
-    params = read_params()
-
-    lines_by = {p["id"]: qdf("SELECT * FROM bom_lines WHERE product_id=? ORDER BY id", (p["id"],)).to_dict("records") for p in products}
-    legs_by = {p["id"]: qdf("SELECT * FROM transport_legs WHERE product_id=? ORDER BY id", (p["id"],)).to_dict("records") for p in products}
-    ov_by = {p["id"]: qdf("SELECT * FROM overrides WHERE product_id=? AND active=1", (p["id"],)).to_dict("records") for p in products}
-    results, baseline = {}, {}
+def portfolio_df(products, factors, approved_only=False) -> pd.DataFrame:
+    rows = []
     for p in products:
+        if approved_only and p["status"] != "Approved":
+            continue
+        r, e = safe_results(p, factors)
+        row = {"id": p["id"], "name": p["name"], "category": p["category"], "status": p["status"],
+               "functional_unit": p["functional_unit"]}
+        if r:
+            row.update({s: round(r["stages"][s]["ghg"], 2) for s in STAGES})
+            row.update({"total_kg_co2e": round(r["total_ghg"], 2),
+                        "per_year_kg": round(r["per_year_ghg"], 2) if math.isfinite(r["per_year_ghg"]) else None,
+                        "total_mj": round(r["total_mj"], 1)})
+        else:
+            row["error"] = e
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+def page_reports():
+    db = st.session_state.db
+    factors = current_factors()
+    page_header("📄 Reports & export", "Traceable outputs: styled HTML report, line-item CSV, full lineage JSON bundle and portfolio summary. Exports are audited.")
+    stake = st.session_state.role == "Stakeholder"
+    prods = [p for p in db["products"] if (p["status"] == "Approved" if stake else p["status"] != "Archived")]
+    if stake:
+        st.info("👁️ Stakeholder role: approved records only.")
+    if not prods and not stake:
+        st.info("No records available."); return
+    fmt_pick = st.radio("Format", ["HTML report", "Line items (CSV)", "Lineage bundle (JSON)", "Portfolio summary (CSV)"],
+                        horizontal=True, key="rpt_fmt")
+    pid = None
+    if fmt_pick != "Portfolio summary (CSV)":
+        if not prods:
+            st.warning("No approved records to export yet."); return
+        pid = st.selectbox("Product", [p["id"] for p in prods], key="rpt_pick",
+                           format_func=lambda i: f"{i} — {product_by_id(i)['name']} ({product_by_id(i)['status']})")
+    if st.button("⚙️ Generate", type="primary", key="rpt_gen"):
         try:
-            results[p["id"]] = assess(p, lines_by[p["id"]], legs_by[p["id"]], params, factors, ov_by[p["id"]])
-            baseline[p["id"]] = assess(p, lines_by[p["id"]], legs_by[p["id"]], DEFAULT_PARAMS, factors, ov_by[p["id"]])
-        except ValueError as e:
-            st.error(f"Engine validation error for {p['name']}: {e}")
-            st.stop()
-    mc = monte_carlo(results[pid], factors, params["mc_runs"], params["seed"])
-    prod = next(p for p in products if p["id"] == pid)
-    run_id = hashlib.sha1(json.dumps({"pid": pid, "params": params, "fv": version, "ev": ENGINE_VERSION,
-                                      "upd": prod["updated_at"]}, sort_keys=True).encode()).hexdigest()[:10]
-    ctx = {"products": products, "prod": prod, "pid": pid, "role": role, "actor": actor,
-           "params": params, "factors": factors, "version": version, "run_id": run_id,
-           "lines": lines_by[pid], "legs": legs_by[pid], "overrides": ov_by[pid],
-           "res": results[pid], "results": results, "baseline": baseline, "mc": mc}
+            if stake:
+                guard("export_approved")
+            else:
+                guard("export")
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%d")
+            if fmt_pick == "Portfolio summary (CSV)":
+                df = portfolio_df(db["products"], factors, approved_only=stake)
+                st.session_state.report_cache = {"fmt": fmt_pick, "name": f"portfolio_summary_{stamp}.csv",
+                                                 "data": df.to_csv(index=False), "mime": "text/csv", "df": df}
+                log_event("export", "portfolio", "all", f"Portfolio CSV ({len(df)} rows)")
+            else:
+                p = product_by_id(pid)
+                r, e = safe_results(p, factors)
+                if e: raise ValueError(e)
+                if fmt_pick == "HTML report":
+                    mc = cached_mc(json.dumps(p, sort_keys=True), json.dumps(factors, sort_keys=True),
+                                   2000, db["settings"]["mc_seed"])
+                    audit_rows = [a for a in db["audit"] if a["entity_id"] == pid][-10:]
+                    data = html_report(p, r, validate_product(p), mc, db["factor_version"], audit_rows)
+                    st.session_state.report_cache = {"fmt": fmt_pick, "name": f"report_{pid}_{stamp}.html",
+                                                     "data": data, "mime": "text/html", "pid": pid}
+                elif fmt_pick == "Line items (CSV)":
+                    df = pd.DataFrame(r["lines"])
+                    st.session_state.report_cache = {"fmt": fmt_pick, "name": f"line_items_{pid}_{stamp}.csv",
+                                                     "data": df.to_csv(index=False), "mime": "text/csv", "df": df}
+                else:
+                    mc = cached_mc(json.dumps(p, sort_keys=True), json.dumps(factors, sort_keys=True),
+                                   2000, db["settings"]["mc_seed"])
+                    bundle = {"product": p, "results": r, "validation": validate_product(p),
+                              "factor_version": db["factor_version"], "factors": factors,
+                              "engine_version": ENGINE_VERSION, "result_digest": result_digest(r),
+                              "mc": {k: v for k, v in mc.items() if k != "totals"},
+                              "audit": [a for a in db["audit"] if a["entity_id"] == pid],
+                              "generated_utc": utcnow(), "synthetic_demo": True}
+                    st.session_state.report_cache = {"fmt": fmt_pick, "name": f"lineage_{pid}_{stamp}.json",
+                                                     "data": json.dumps(bundle, indent=2), "mime": "application/json"}
+                log_event("export", "product", pid, fmt_pick)
+            st.toast("Report generated & audit-logged", icon="📄")
+        except (ValueError, PermissionError) as ex:
+            st.error(str(ex))
+    cache = st.session_state.report_cache
+    if cache:
+        st.download_button(f"⬇️ Download {cache['name']}", cache["data"], file_name=cache["name"],
+                           mime=cache["mime"], key="rpt_dl", type="primary")
+        if cache["fmt"] == "HTML report":
+            p = product_by_id(cache.get("pid"))
+            if p and p["status"] != "Approved":
+                st.caption("🔴 Watermarked DRAFT — approval required before external sharing.")
+            components_html(cache["data"], height=560, scrolling=True)
+        elif "df" in cache:
+            st.dataframe(cache["df"], hide_index=True, height=320, **_w(st.dataframe))
+        else:
+            st.code(cache["data"][:1500] + ("\n… (truncated preview — full file in download)" if len(cache["data"]) > 1500 else ""),
+                    language="json")
 
-    if st.session_state.get("flash"):
-        kind, msg = st.session_state.pop("flash")
-        getattr(st, kind)(msg)
+# ══════════════════════════════ PAGE: GOVERNANCE & QA ══════════════════════════════
+def page_governance():
+    db = st.session_state.db
+    factors = current_factors()
+    page_header("🛡️ Governance & QA", "Audit trail, lineage, versioned reference data, data dictionary, schema, self-checks, backup/restore and product documentation.")
+    tabs = st.tabs(["📜 Audit log", "🧬 Lineage", "📚 Reference factors", "🗂️ Data dictionary",
+                    "🗺️ Schema & workflow", "🧪 Self-checks", "💾 Backup & restore", "📘 Product docs"])
+    with tabs[0]:
+        f1, f2 = st.columns(2)
+        actions = sorted({a["action"] for a in db["audit"]})
+        fa = f1.multiselect("Action", actions, key="aud_act")
+        fp = f2.selectbox("Record", ["(all)"] + [p["id"] for p in db["products"]], key="aud_pid")
+        rows = [a for a in db["audit"][::-1]
+                if (not fa or a["action"] in fa) and (fp == "(all)" or a["entity_id"] == fp)]
+        st.dataframe(pd.DataFrame(rows), hide_index=True, height=380, **_w(st.dataframe))
+        st.download_button("⬇️ Export audit (CSV)", pd.DataFrame(rows).to_csv(index=False),
+                           "audit_log.csv", "text/csv", key="aud_dl", disabled=not can("export"))
+    with tabs[1]:
+        prods = db["products"]
+        if prods:
+            pid = st.selectbox("Record", [p["id"] for p in prods], key="lin_pick",
+                               format_func=lambda i: f"{i} — {product_by_id(i)['name']}")
+            p = product_by_id(pid)
+            r, e = safe_results(p, factors)
+            src = p["source"]
+            chain = (f"**{src.get('file', src.get('kind','manual'))}** → import/manual entry → "
+                     f"validation rules v{SCHEMA_VERSION} → engine **{ENGINE_VERSION}** × factors "
+                     f"**{db['factor_version']}** → result" + (f" `{result_digest(r)}`" if r else " (blocked)"))
+            st.markdown(chain)
+            st.json(src, expanded=False)
+            if e: st.error(e)
+            if r:
+                st.dataframe(pd.DataFrame(r["lines"])[["stage", "item", "factor_id", "factor", "qty", "unit", "ghg", "mj", "quality", "sigma"]],
+                             hide_index=True, height=320, **_w(st.dataframe))
+            batch = next((b for b in db["imports"] if b["id"] == src.get("batch_id")), None)
+            if batch:
+                st.caption(f"Source batch {batch['id']} preserved · sha256 `{batch['sha256']}` · {batch['rows']} rows")
+    with tabs[2]:
+        versions = list(db["factor_versions"])
+        v = st.selectbox("Inspect version", versions, index=versions.index(db["factor_version"]), key="fac_ver")
+        fv = db["factor_versions"][v]
+        c = st.columns(3)
+        c[0].dataframe(pd.DataFrame([{"material": k, **vals} for k, vals in fv["materials"].items()]),
+                       hide_index=True, height=300, **_w(st.dataframe))
+        c[1].dataframe(pd.DataFrame([{"grid": k, **vals} for k, vals in fv["grids"].items()]),
+                       hide_index=True, height=300, **_w(st.dataframe))
+        c[2].dataframe(pd.DataFrame([{"mode": k, **vals} for k, vals in fv["transport"].items()]),
+                       hide_index=True, height=300, **_w(st.dataframe))
+        st.caption("Units — materials: kgCO₂e/kg & MJ/kg · grids: kgCO₂e/kWh & MJ/kWh · transport: per t·km. "
+                   "Illustrative synthetic values; replace with a licensed database (e.g. ecoinvent) after license review.")
+        a1, a2 = st.columns(2)
+        if a1.button(f"⏪ Activate inspected version ({v})", key="fac_roll", disabled=not can("factors")):
+            old = db["factor_version"]
+            db["factor_version"] = v
+            log_event("factor_rollback", "factors", v, f"{old} → {v}")
+            st.toast(f"Factor set rolled back to {v}", icon="⏪"); st.rerun()
+        with st.expander("✏️ Publish new grid-factor version (Administrator)"):
+            new_vals = {}
+            for i, (gname, g) in enumerate(factors["grids"].items()):
+                new_vals[gname] = st.number_input(f"{gname} — kgCO₂e/kWh", 0.001, 2.0, float(g["ghg"]), 0.005,
+                                                  key=f"fg_{i}", format="%.3f", disabled=not can("factors"))
+            if st.button("🚀 Publish new version", key="fac_pub", disabled=not can("factors")):
+                k = len(db["factor_versions"]) + 1
+                nv = f"SYN-2026.{k}"
+                while nv in db["factor_versions"]:
+                    k += 1; nv = f"SYN-2026.{k}"
+                nf = copy.deepcopy(factors)
+                for gname, val in new_vals.items():
+                    nf["grids"][gname]["ghg"] = float(val)
+                db["factor_versions"][nv] = nf
+                db["factor_version"] = nv
+                log_event("factor_publish", "factors", nv, f"Grid factors updated from {st.session_state.db['factor_version']}")
+                st.toast(f"Published {nv} — all results recompute against it", icon="🚀"); st.rerun()
+    with tabs[3]:
+        dd = [
+            ("products.id", "text PK", "—", "Stable record identifier", "unique", "system", "internal", "required, unique"),
+            ("products.status", "enum", "—", "Lifecycle state", ", ".join(STATUSES), "workflow", "internal", "transition matrix"),
+            ("products.lifetime_years", "float", "years", "Service life", "(0, 100]", "analyst/import", "internal", ">0, ≤100; >30 warns"),
+            ("bom.component", "text", "—", "Component name", "free", "analyst/import", "internal", "required; dup warns"),
+            ("bom.material", "FK", "—", "Reference material", "catalog keys", "catalog", "public", "must exist in factor set"),
+            ("bom.mass_kg", "float", "kg", "Component mass", ">0", "BOM/supplier", "commercial-sensitive", ">0; >5000 warns"),
+            ("bom.recycled_pct", "float", "%", "Recycled content", "0–100", "supplier decl.", "commercial-sensitive", "range check"),
+            ("bom.quality", "enum", "—", "Pedigree → MC sigma", "measured/estimated/proxy", "analyst", "internal", "enum check"),
+            ("manufacturing.kwh", "float", "kWh", "Assembly electricity", "≥0", "meter/estimate", "commercial-sensitive", "≥0"),
+            ("manufacturing.grid / use.grid", "FK", "kgCO₂e/kWh", "Electricity mix", "catalog keys", "catalog", "public", "must exist"),
+            ("use.kwh_per_year", "float", "kWh/y", "Operational energy", "≥0", "telematics/estimate", "internal", "≥0"),
+            ("transport.mode", "FK", "—", "Freight mode", "catalog keys", "logistics", "internal", "must exist"),
+            ("transport.distance_km", "float", "km", "Leg distance", "0–100000", "logistics", "internal", "range; air>8000 warns"),
+            ("eol.*_pct", "float", "%", "Fate shares", "0–100, Σ=100", "waste manifest", "internal", "sum 100 ±0.5"),
+            ("override.total_ghg", "float", "kg CO₂e", "Manual override", "≥0 + reason", "reviewer", "restricted", "reason & audit required"),
+            ("imports.sha256", "text", "—", "Source checksum", "hex-64", "system", "internal", "computed on upload"),
+            ("audit.ts", "ISO-8601", "UTC", "Event time", "timezone-aware", "system", "restricted", "auto"),
+            ("factor_versions.version", "text PK", "—", "Reference-data version", "SYN-YYYY.n", "admin", "public", "immutable snapshots"),
+            ("scenarios.params", "json", "mixed", "Scenario levers", "schema-checked", "analyst", "internal", "validated on apply"),
+            ("*.created/updated_utc", "ISO-8601", "UTC", "Timestamps", "timezone-aware", "system", "internal", "auto"),
+        ]
+        st.dataframe(pd.DataFrame(dd, columns=["field", "type", "unit", "meaning", "allowed", "source", "sensitivity", "validation"]),
+                     hide_index=True, height=420, **_w(st.dataframe))
+    with tabs[4]:
+        st.markdown("**Record workflow (actors & exception path)**")
+        st.graphviz_chart(WORKFLOW_DOT, **_w(st.graphviz_chart))
+        st.markdown("**Normalized schema (SQLite MVP → PostgreSQL team edition)**")
+        st.graphviz_chart(ERD_DOT, **_w(st.graphviz_chart))
+        st.caption("MVP persists in-session with JSON backup/restore; the same entities map 1:1 to SQLite/PostgreSQL "
+                   "tables (SQLAlchemy + Alembic migration path). Large originals live outside relational rows — "
+                   "metadata + SHA-256 inside. Retention: soft-deleted records recoverable until the next deletion; "
+                   "import originals retained in batch records; backups are operator-managed.")
+    with tabs[5]:
+        st.markdown("**Deterministic self-checks** — hand-checkable math, validation rules, import rejections, "
+                    "reproducibility, permissions and audit provenance. Software correctness ≠ domain certification.")
+        if st.button("▶ Run self-checks", type="primary", key="qa_run") or st.session_state.qa_results is None:
+            with st.spinner("Running 18 checks…"):
+                st.session_state.qa_results = run_self_checks()
+                st.session_state.qa_ts = utcnow()
+        res = st.session_state.qa_results
+        passed = sum(x["passed"] for x in res)
+        (st.success if passed == len(res) else st.error)(f"{passed}/{len(res)} checks passed · {st.session_state.qa_ts}")
+        st.dataframe(pd.DataFrame([{"check": x["check"], "result": "✅ PASS" if x["passed"] else "❌ FAIL",
+                                    "detail": x["detail"]} for x in res]),
+                     hide_index=True, height=420, **_w(st.dataframe))
+        st.download_button("⬇️ QA report (JSON)",
+                           json.dumps({"ran_utc": st.session_state.qa_ts, "engine": ENGINE_VERSION,
+                                       "factor_version": db["factor_version"],
+                                       "summary": {"passed": passed, "total": len(res)}, "results": res}, indent=2),
+                           "qa_report.json", "application/json", key="qa_dl")
+        st.caption("Evaluation stance: the deterministic factor model **is** the baseline; Monte Carlo propagates "
+                   "pedigree uncertainty. No ML is trained on synthetic data and no real-world predictive performance is claimed.")
+    with tabs[6]:
+        b1, b2 = st.columns(2)
+        backup = json.dumps({"backup_version": 1, "schema_version": SCHEMA_VERSION,
+                             "exported_utc": utcnow(), "db": db}, indent=2)
+        b1.download_button("⬇️ Full backup (JSON)", backup,
+                           f"ecoledger_backup_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M')}.json",
+                           "application/json", key="bk_dl", disabled=not can("export"))
+        b1.caption("Includes products, audit, factor versions, scenarios, import originals & checksums.")
+        up = b2.file_uploader("Restore from backup (JSON)", type=["json"], key="rs_up",
+                              disabled=not can("restore"))
+        confirm = b2.checkbox("I understand this replaces the current workspace", key="rs_confirm",
+                              disabled=not can("restore"))
+        if b2.button("♻️ Restore backup", key="rs_go", disabled=not (can("restore") and up and confirm)):
+            try:
+                data = json.loads(up.getvalue().decode("utf-8"))
+                nd = data["db"]
+                assert isinstance(nd["products"], list) and isinstance(nd["audit"], list)
+                assert nd["factor_version"] in nd["factor_versions"]
+                st.session_state.db = nd
+                st.session_state.selected_product = None
+                st.session_state.report_cache = None
+                log_event("restore", "workspace", "backup", f"{len(nd['products'])} products restored")
+                st.toast("Workspace restored from backup", icon="♻️"); st.rerun()
+            except Exception as ex:
+                st.error(f"Restore rejected (current data untouched): {ex}")
+        with st.expander("🧨 Danger zone — reset demo workspace"):
+            rc = st.checkbox("Confirm full reset to synthetic demo seed", key="reset_confirm",
+                             disabled=not can("reset"))
+            if st.button("Reset demo data", key="reset_go", disabled=not (can("reset") and rc)):
+                st.session_state.db = build_demo_db()
+                st.session_state.selected_product = None
+                st.session_state.intro_done = False
+                st.session_state.qa_results = None
+                st.session_state.report_cache = None
+                log_event("reset", "workspace", "demo", "Reset to synthetic seed")
+                st.toast("Demo workspace reset", icon="🧨"); st.rerun()
+    with tabs[7]:
+        st.markdown("""
+**Problem.** Sustainability teams rebuild product footprints in fragile spreadsheets: inconsistent factors,
+no review trail, no uncertainty, hours per study. **Buyer (pilot persona):** a municipal sustainability lead
+commissioning comparable cradle-to-grave estimates for procured assets.
 
-    {"Overview": page_overview, "Products & BOM": page_products, "Import data": page_import,
-     "Analysis": page_analysis, "Review & approvals": page_review, "Reports": page_reports,
-     "Governance": page_governance}[st.session_state["nav"]](ctx)
+**Personas & roles.** Ava (Analyst) enters BOM/energy/logistics data · Dr. Patel (Reviewer) approves or requests
+changes with notes · Morgan (Administrator) manages factors, archives, backups · Sam (Stakeholder) reads and
+exports approved reports only.
 
+**In scope (MVP).** Synthetic demo portfolio · CSV/XLSX import with row-level validation & error reports ·
+deterministic 5-stage engine · seeded Monte Carlo · scenario lab · review/approval workflow with overrides ·
+audit + lineage · HTML/CSV/JSON exports · backup/restore · factor versioning with rollback · this self-check suite.
+
+**Out of scope (MVP).** Licensed LCA databases, certified EPDs, multi-user auth/SSO, ERP adapters, ML forecasts,
+regulatory compliance claims. **Success metrics (pilot, to be measured with real users):** time-to-first-report,
+% imports passing without manual fixes, reviewer turnaround, reproducibility digest match rate. No customer
+impact is claimed until piloted.
+
+| Acceptance criterion | Pass condition | Verify in |
+|---|---|---|
+| Sample import | 2 products imported from documented CSV | Import → built-in valid sample |
+| Malformed rejection | Row-level actionable errors + downloadable report; nothing committed | Import → broken sample |
+| Reproducibility | Same inputs/versions → identical digest & MC seed → identical draws | Analysis · Self-checks |
+| Traceability | Every line shows factor ID, version, formula, quality | Analysis → explanation panel |
+| Workflow | Draft→Validated→In Review→Approved with role gates & exception path | Products · Review |
+| Export | Watermarked HTML report + CSV + lineage JSON downloaded | Reports |
+| Automated checks | 18/18 self-checks pass on this machine | Self-checks tab |
+| Clean restart | Reset demo reproduces the identical seed portfolio | Backup & restore |
+
+| Risk | Mitigation |
+|---|---|
+| Domain validity (illustrative factors) | Synthetic labels everywhere; licensed-data gate before external use; practitioner review |
+| Data quality | Pedigree sigmas, validation gates, warnings in every report |
+| Security | Handler-level role guards, upload validation, no secrets, checksummed originals, audit |
+| Adoption | One narrow workflow end-to-end; demo mode; saved views; undo |
+| Operational failure | Backup/restore, never-overwrite imports, soft delete + undo, versioned factor rollback |
+
+**Tiers.** Local MVP (1 operator, free eval) → Team (PostgreSQL, roles, approvals, per-seat) → Enterprise
+(SSO, audit export, on-prem, SLA). Pricing hypothesis: per-seat + per-site license; validated via interviews
+and a pilot, not assumed. **90-day roadmap:** weeks 1–4 pilot with 2 municipalities & weekly feedback;
+weeks 5–8 SQLite persistence + licensed-factor evaluation; weeks 9–12 team edition beta + measured usage review.
+
+**License inventory (commercial-compatible):** Streamlit (Apache-2.0) · pandas (BSD-3) · NumPy (BSD-3) ·
+Plotly (MIT) · openpyxl (MIT). Dependencies unpinned here per request — pin via `pip freeze` for release SBOM.
+
+**Human-approval boundary:** this software is decision support. Regulated or safety-sensitive use requires
+qualified review, licensed reference data and authorized human approval. Measured vs estimated data are
+distinguished via the pedigree field; no certification or compliance is claimed.
+""")
+
+# ══════════════════════════════ MAIN ══════════════════════════════
+def main():
+    st.set_page_config(page_title=f"{APP_NAME} — Lifecycle Impact Calculator", page_icon="🌿",
+                       layout="wide", initial_sidebar_state="expanded")
+    st.markdown(CSS, unsafe_allow_html=True)
+    init_state()
+    pend = st.session_state.pop("_nav_pending", None)
+    if pend:
+        st.session_state.nav = pend
+    choice = sidebar()
+    {NAV[0]: page_overview, NAV[1]: page_products, NAV[2]: page_analysis, NAV[3]: page_scenarios,
+     NAV[4]: page_import, NAV[5]: page_review, NAV[6]: page_reports, NAV[7]: page_governance}[choice]()
+    st.divider()
+    st.caption(f"🌿 {APP_NAME} · Engine {ENGINE_VERSION} · Factors {st.session_state.db['factor_version']} · "
+               "SYNTHETIC demo data with illustrative factors — decision support only, not a certified LCA/EPD. "
+               "All mutations audited · no API keys · runs fully local.")
 
 if __name__ == "__main__":
     main()
